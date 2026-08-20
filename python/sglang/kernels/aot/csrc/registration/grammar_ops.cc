@@ -12,13 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
 
-#include "sgl_kernel_ops.h"
+#include "grammar/apply_token_bitmask_inplace_cuda.h"
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
-  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+  m.impl("apply_token_bitmask_inplace_cuda", TORCH_BOX(&ApplyTokenBitmaskInplace));
 }

@@ -28,4 +28,10 @@ inline cudaStream_t get_current_cuda_stream(torch::stable::accelerator::DeviceIn
   return static_cast<cudaStream_t>(stream_ptr);
 }
 
+// Preserve legacy no-argument stream selection for kernels whose existing
+// contract is tied to the process's current CUDA device.
+inline cudaStream_t get_current_cuda_stream() {
+  return get_current_cuda_stream(torch::stable::accelerator::getCurrentDeviceIndex());
+}
+
 }  // namespace sgl_kernel::stable

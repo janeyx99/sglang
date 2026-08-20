@@ -15,23 +15,6 @@ limitations under the License.
 
 #pragma once
 
-#include <optional>
+#include "sgl_kernel_torch_compat.h"
 
-#ifdef TORCH_TARGET_VERSION
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/util/Exception.h>
-
-using SglTensor = torch::stable::Tensor;
-template <typename T>
-using SglOptional = std::optional<T>;
-#define SGL_TORCH_CHECK STD_TORCH_CHECK
-#define SGL_MUTABLE_DATA_PTR(tensor) (tensor).mutable_data_ptr()
-#else
-#include <ATen/ATen.h>
-
-using SglTensor = at::Tensor;
-template <typename T>
-using SglOptional = at::optional<T>;
-#define SGL_TORCH_CHECK TORCH_CHECK
-#define SGL_MUTABLE_DATA_PTR(tensor) (tensor).data_ptr()
-#endif
+void ApplyTokenBitmaskInplace(SglTensor logits, SglTensor bitmask, SglOptional<SglTensor> indices);

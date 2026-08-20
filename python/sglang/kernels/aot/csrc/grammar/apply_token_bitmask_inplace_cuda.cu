@@ -22,13 +22,64 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
+#include "grammar/apply_token_bitmask_inplace_cuda.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include <cuda.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Half.h>
+
+#include "sgl_kernel_cuda_stream.h"
+
+using SglBFloat16 = torch::headeronly::BFloat16;
+using SglHalf = torch::headeronly::Half;
+using SglScalarType = torch::headeronly::ScalarType;
+#else
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 
+using SglBFloat16 = at::BFloat16;
+using SglHalf = at::Half;
+using SglScalarType = at::ScalarType;
+#endif
+
+template <typename T>
+T* MutableDataPtr(const SglTensor& tensor) {
+#ifdef TORCH_TARGET_VERSION
+  return tensor.mutable_data_ptr<T>();
+#else
+  return tensor.data_ptr<T>();
+#endif
+}
+
+template <typename T>
+const T* ConstDataPtr(const SglTensor& tensor) {
+#ifdef TORCH_TARGET_VERSION
+  return tensor.const_data_ptr<T>();
+#else
+  return tensor.data_ptr<T>();
+#endif
+}
+
+inline cudaStream_t GetCurrentCUDAStream() {
+#ifdef TORCH_TARGET_VERSION
+  return sgl_kernel::stable::get_current_cuda_stream();
+#else
+  return at::cuda::getCurrentCUDAStream().stream();
+#endif
+}
+
 
 #if !defined(USE_ROCM) && (!defined(CUDA_VERSION) || CUDA_VERSION < 12040)
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
-  TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
+void ApplyTokenBitmaskInplace(SglTensor logits, SglTensor bitmask, SglOptional<SglTensor> indices = {}) {
+  SGL_TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
 }
 #else
 
@@ -149,7 +200,7 @@ void ApplyTokenBitmaskInplaceDispatchToBitsPerThread(
   const int32_t num_bits_per_thread = CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * num_blocks_per_row);
 
   const dim3 block(THREADS_PER_THREAD_BLOCK);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t stream = GetCurrentCUDAStream();
 
   if (num_bits_per_thread <= 4 && kAlignment <= 4) {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 4), num_rows);
@@ -188,24 +239,24 @@ void ApplyTokenBitmaskInplaceDispatchToPackedT(
   }
 }
 
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
-  TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor.");
-  TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous.");
-  TORCH_CHECK(logits.dim() == 1 || logits.dim() == 2, "logits must be a 1D or 2D tensor.");
+void ApplyTokenBitmaskInplace(SglTensor logits, SglTensor bitmask, SglOptional<SglTensor> indices = {}) {
+  SGL_TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor.");
+  SGL_TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous.");
+  SGL_TORCH_CHECK(logits.dim() == 1 || logits.dim() == 2, "logits must be a 1D or 2D tensor.");
   std::pair<int32_t, int32_t> logits_shape =
       logits.dim() == 2 ? std::make_pair(static_cast<int32_t>(logits.size(0)), static_cast<int32_t>(logits.size(1)))
                         : std::make_pair(1, static_cast<int32_t>(logits.size(0)));
 
-  TORCH_CHECK(bitmask.is_cuda(), "bitmask must be a CUDA tensor.");
-  TORCH_CHECK(bitmask.is_contiguous(), "bitmask must be contiguous.");
-  TORCH_CHECK(bitmask.dim() == 1 || bitmask.dim() == 2, "bitmask must be a 1D or 2D tensor.");
+  SGL_TORCH_CHECK(bitmask.is_cuda(), "bitmask must be a CUDA tensor.");
+  SGL_TORCH_CHECK(bitmask.is_contiguous(), "bitmask must be contiguous.");
+  SGL_TORCH_CHECK(bitmask.dim() == 1 || bitmask.dim() == 2, "bitmask must be a 1D or 2D tensor.");
   std::pair<int32_t, int32_t> bitmask_shape =
       bitmask.dim() == 2 ? std::make_pair(static_cast<int32_t>(bitmask.size(0)), static_cast<int32_t>(bitmask.size(1)))
                          : std::make_pair(1, static_cast<int32_t>(bitmask.size(0)));
 
-  TORCH_CHECK(bitmask.dtype() == torch::kInt32, "bitmask must be of type int32.");
+  SGL_TORCH_CHECK(bitmask.scalar_type() == SglScalarType::Int, "bitmask must be of type int32.");
 
-  TORCH_CHECK(
+  SGL_TORCH_CHECK(
       (logits_shape.second + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK >= bitmask_shape.second,
       "The provided logits's vocab size should be no less than the bitmask's vocab size "
       "(converted from bitmask size). But got vocab size ",
@@ -216,23 +267,23 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
   int vocab_size = std::min(logits_shape.second, bitmask_shape.second * BITS_PER_BLOCK);
 
   int32_t num_rows = logits_shape.first;
-  int32_t* indices_ptr = nullptr;
+  const int32_t* indices_ptr = nullptr;
   if (indices) {
-    TORCH_CHECK(indices->is_cuda(), "indices must be a CUDA tensor.");
-    TORCH_CHECK(indices->is_contiguous(), "indices must be contiguous.");
-    TORCH_CHECK(indices->dim() == 1, "indices must be a 1D tensor.");
-    TORCH_CHECK(indices->dtype() == torch::kInt32, "indices must be of type int32.");
+    SGL_TORCH_CHECK(indices->is_cuda(), "indices must be a CUDA tensor.");
+    SGL_TORCH_CHECK(indices->is_contiguous(), "indices must be contiguous.");
+    SGL_TORCH_CHECK(indices->dim() == 1, "indices must be a 1D tensor.");
+    SGL_TORCH_CHECK(indices->scalar_type() == SglScalarType::Int, "indices must be of type int32.");
     num_rows = indices->size(0);
-    indices_ptr = indices->data_ptr<int32_t>();
+    indices_ptr = ConstDataPtr<int32_t>(*indices);
   } else {
-    TORCH_CHECK(logits_shape.first == bitmask_shape.first, "logits and bitmask must have the same batch size.");
+    SGL_TORCH_CHECK(logits_shape.first == bitmask_shape.first, "logits and bitmask must have the same batch size.");
   }
 
   switch (logits.scalar_type()) {
-    case torch::kFloat32: {
+    case SglScalarType::Float: {
       ApplyTokenBitmaskInplaceDispatchToPackedT(
-          logits.data_ptr<float>(),
-          bitmask.data_ptr<int32_t>(),
+          MutableDataPtr<float>(logits),
+          ConstDataPtr<int32_t>(bitmask),
           indices_ptr,
           vocab_size,
           logits_shape.second,
@@ -240,10 +291,10 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
           num_rows);
       break;
     }
-    case torch::kFloat16: {
+    case SglScalarType::Half: {
       ApplyTokenBitmaskInplaceDispatchToPackedT(
-          reinterpret_cast<__half*>(logits.data_ptr<torch::Half>()),
-          bitmask.data_ptr<int32_t>(),
+          reinterpret_cast<__half*>(MutableDataPtr<SglHalf>(logits)),
+          ConstDataPtr<int32_t>(bitmask),
           indices_ptr,
           vocab_size,
           logits_shape.second,
@@ -251,10 +302,10 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
           num_rows);
       break;
     }
-    case torch::kBFloat16: {
+    case SglScalarType::BFloat16: {
       ApplyTokenBitmaskInplaceDispatchToPackedT(
-          reinterpret_cast<__nv_bfloat16*>(logits.data_ptr<torch::BFloat16>()),
-          bitmask.data_ptr<int32_t>(),
+          reinterpret_cast<__nv_bfloat16*>(MutableDataPtr<SglBFloat16>(logits)),
+          ConstDataPtr<int32_t>(bitmask),
           indices_ptr,
           vocab_size,
           logits_shape.second,
@@ -263,7 +314,7 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
       break;
     }
     default:
-      TORCH_CHECK(false, "logits dtype must be float, half or bfloat16.");
+      SGL_TORCH_CHECK(false, "logits dtype must be float, half or bfloat16.");
       break;
   }
 }
