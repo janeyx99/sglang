@@ -12,14 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <torch/csrc/stable/library.h>
 
-#include "memory/weak_ref_tensor.h"
+#pragma once
 
-STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
-}
+#include "sgl_kernel_torch_compat.h"
 
-STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
-  m.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
-}
+SglTensor weak_ref_tensor(const SglTensor& tensor);

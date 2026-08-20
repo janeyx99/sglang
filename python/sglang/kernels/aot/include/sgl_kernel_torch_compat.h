@@ -12,14 +12,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <torch/csrc/stable/library.h>
 
-#include "memory/weak_ref_tensor.h"
+#pragma once
 
-STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
-}
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/util/Exception.h>
 
-STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
-  m.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
-}
+using SglTensor = torch::stable::Tensor;
+#define SGL_TORCH_CHECK STD_TORCH_CHECK
+#define SGL_MUTABLE_DATA_PTR(tensor) (tensor).mutable_data_ptr()
+#else
+#include <ATen/ATen.h>
+
+using SglTensor = at::Tensor;
+#define SGL_TORCH_CHECK TORCH_CHECK
+#define SGL_MUTABLE_DATA_PTR(tensor) (tensor).data_ptr()
+#endif

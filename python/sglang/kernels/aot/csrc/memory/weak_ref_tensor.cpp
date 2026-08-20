@@ -15,15 +15,25 @@ limitations under the License.
 
 // Adapted from: https://github.com/vllm-project/vllm/blob/main/csrc/ops.h
 
-#include <ATen/ATen.h>
-#include <ATen/Tensor.h>
+#include "memory/weak_ref_tensor.h"
 
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/ops.h>
+#else
 #include <vector>
+#endif
 
-at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_cuda(), "weak_ref_tensor expects a CUDA tensor");
+SglTensor weak_ref_tensor(const SglTensor& tensor) {
+  SGL_TORCH_CHECK(tensor.is_cuda(), "weak_ref_tensor expects a CUDA tensor");
 
-  void* data_ptr = tensor.data_ptr();
+  void* data_ptr = SGL_MUTABLE_DATA_PTR(tensor);
+#ifdef TORCH_TARGET_VERSION
+  SGL_TORCH_CHECK(
+      data_ptr != nullptr, "The specified pointer resides on host memory and is not registered with any CUDA device.");
+
+  return torch::stable::from_blob(
+      data_ptr, tensor.sizes(), tensor.strides(), tensor.device(), tensor.scalar_type(), 0, tensor.layout());
+#else
   std::vector<int64_t> sizes = tensor.sizes().vec();
   std::vector<int64_t> strides = tensor.strides().vec();
 
@@ -32,4 +42,5 @@ at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
   auto new_tensor = at::from_blob(data_ptr, sizes, strides, options);
 
   return new_tensor;
+#endif
 }
