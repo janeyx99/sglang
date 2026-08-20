@@ -3,7 +3,7 @@
 // Migrated from `3rdparty/infllmv2_cuda_impl/csrc/max_pooling_1d.cuh`. The
 // device kernels are kept faithful to the original; only the host-side
 // launchers are rewritten from the raw `cudaStream_t` + `data_ptr` pybind
-// interface to the sgl-kernel `at::Tensor` + torch.ops convention.
+// interface to the sgl-kernel `torch::stable::Tensor` + torch.ops convention.
 //
 // Notes vs. the original implementation:
 //   * `TypeTraits<T>::inf()` is replaced by `static_cast<T>(INFINITY)`, and the
@@ -12,12 +12,17 @@
 //   * Outputs are pre-allocated on the Python side and passed in (the original
 //     wrappers also allocated a zero-filled output before launching).
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/shim_utils.h>
 
-#include "utils.h"
+#include "infllm_v2/max_pooling.h"
 
 namespace {
 
@@ -98,11 +103,11 @@ __global__ void max_pooling_1d_varlen_kernel(
 }  // namespace
 
 void infllm_v2_max_pooling_1d_varlen(
-    at::Tensor input,
-    at::Tensor output,
-    at::Tensor cu_seqlens_q,
-    at::Tensor cu_seqlens_k,
-    at::Tensor cache_lens,
+    torch::stable::Tensor input,
+    torch::stable::Tensor output,
+    torch::stable::Tensor cu_seqlens_q,
+    torch::stable::Tensor cu_seqlens_k,
+    torch::stable::Tensor cache_lens,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     int64_t kernel_size,
@@ -112,38 +117,63 @@ void infllm_v2_max_pooling_1d_varlen(
     int64_t local_blocks,
     int64_t init_blocks,
     int64_t total_q) {
-  TORCH_CHECK(input.dim() == 3, "input must be 3D [num_heads, total_q, max_k]");
-  TORCH_CHECK(output.dim() == 3, "output must be 3D [num_heads, total_q, out_len]");
-  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32");
-  TORCH_CHECK(cu_seqlens_k.scalar_type() == at::kInt, "cu_seqlens_k must be int32");
-  TORCH_CHECK(cache_lens.scalar_type() == at::kInt, "cache_lens must be int32");
+  using torch::headeronly::ScalarType;
+
+  STD_TORCH_CHECK(input.dim() == 3, "input must be 3D [num_heads, total_q, max_k]");
+  STD_TORCH_CHECK(output.dim() == 3, "output must be 3D [num_heads, total_q, out_len]");
+  STD_TORCH_CHECK(cu_seqlens_q.scalar_type() == ScalarType::Int, "cu_seqlens_q must be int32");
+  STD_TORCH_CHECK(cu_seqlens_k.scalar_type() == ScalarType::Int, "cu_seqlens_k must be int32");
+  STD_TORCH_CHECK(cache_lens.scalar_type() == ScalarType::Int, "cache_lens must be int32");
 
   const int batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
   const int num_heads = static_cast<int>(input.size(0));
   const int out_len = static_cast<int>(output.size(2));
   const int grid_q = static_cast<int>(total_q > 0 ? total_q : input.size(1));
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(torch::stable::accelerator::getCurrentDeviceIndex(), &stream_ptr));
+  const cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
   const dim3 grid(grid_q, num_heads);
   const dim3 block(256);
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    max_pooling_1d_varlen_kernel<c_type><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(input.data_ptr()),
-        static_cast<c_type*>(output.data_ptr()),
-        cu_seqlens_q.data_ptr<int>(),
-        cu_seqlens_k.data_ptr<int>(),
-        cache_lens.data_ptr<int>(),
-        batch_size,
-        num_heads,
-        static_cast<int>(max_seqlen_k),
-        out_len,
-        static_cast<int>(kernel_size),
-        static_cast<int>(stride),
-        static_cast<int>(padding),
-        static_cast<int>(block_size),
-        static_cast<int>(local_blocks),
-        static_cast<int>(init_blocks));
-    return true;
-  });
+#define LAUNCH_MAX_POOLING(c_type)                                  \
+  max_pooling_1d_varlen_kernel<c_type><<<grid, block, 0, stream>>>( \
+      static_cast<const c_type*>(input.const_data_ptr()),           \
+      static_cast<c_type*>(output.mutable_data_ptr()),              \
+      cu_seqlens_q.const_data_ptr<int>(),                           \
+      cu_seqlens_k.const_data_ptr<int>(),                           \
+      cache_lens.const_data_ptr<int>(),                             \
+      batch_size,                                                   \
+      num_heads,                                                    \
+      static_cast<int>(max_seqlen_k),                               \
+      out_len,                                                      \
+      static_cast<int>(kernel_size),                                \
+      static_cast<int>(stride),                                     \
+      static_cast<int>(padding),                                    \
+      static_cast<int>(block_size),                                 \
+      static_cast<int>(local_blocks),                               \
+      static_cast<int>(init_blocks))
+
+  switch (input.scalar_type()) {
+#ifdef FLASHINFER_ENABLE_F16
+    case ScalarType::Half:
+      LAUNCH_MAX_POOLING(nv_half);
+      break;
+#endif
+#ifdef FLASHINFER_ENABLE_BF16
+    case ScalarType::BFloat16:
+      LAUNCH_MAX_POOLING(nv_bfloat16);
+      break;
+#endif
+    default:
+      STD_TORCH_CHECK(
+          false,
+          "infllm_v2_max_pooling_1d_varlen(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, "
+          "int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t)::<lambda()> failed to dispatch "
+          "data type ",
+          torch::headeronly::toString(input.scalar_type()));
+  }
+
+#undef LAUNCH_MAX_POOLING
 }

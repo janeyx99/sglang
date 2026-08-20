@@ -12,17 +12,25 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <torch/csrc/stable/library.h>
 
-#include "infllm_v2/max_pooling.h"
+#pragma once
 
-STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def(
-      "infllm_v2_max_pooling_1d_varlen(Tensor input, Tensor! output, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "Tensor cache_lens, int max_seqlen_q, int max_seqlen_k, int kernel_size, int stride, int padding, "
-      "int block_size, int local_blocks, int init_blocks, int total_q) -> ()");
-}
+#include <torch/csrc/stable/tensor_struct.h>
 
-STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
-  m.impl("infllm_v2_max_pooling_1d_varlen", TORCH_BOX(&infllm_v2_max_pooling_1d_varlen));
-}
+#include <cstdint>
+
+void infllm_v2_max_pooling_1d_varlen(
+    torch::stable::Tensor input,
+    torch::stable::Tensor output,
+    torch::stable::Tensor cu_seqlens_q,
+    torch::stable::Tensor cu_seqlens_k,
+    torch::stable::Tensor cache_lens,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t block_size,
+    int64_t local_blocks,
+    int64_t init_blocks,
+    int64_t total_q);

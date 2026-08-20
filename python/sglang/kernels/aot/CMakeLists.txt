@@ -42,7 +42,7 @@ elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
 endif()
 
 # Torch
-find_package(Torch REQUIRED)
+find_package(Torch 2.11 REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos
@@ -375,7 +375,6 @@ set(SOURCES
     ${EXPERT_SPECIALIZATION_SOURCES}
     ${GEMM_SOURCES}
     ${GRAMMAR_SOURCES}
-    ${INFLLM_V2_SOURCES}
     ${KVCACHEIO_SOURCES}
     ${MAMBA_SOURCES}
     ${MEMORY_SOURCES}
@@ -384,6 +383,10 @@ set(SOURCES
     ${SPECULATIVE_SOURCES}
     ${FLASHINFER_SOURCES}
     ${SPARSE_ATTENTION_SOURCES}
+)
+
+set(STABLE_SOURCES
+    ${INFLLM_V2_SOURCES}
 )
 
 set(INCLUDES
@@ -460,6 +463,43 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 # and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+
+# ======================= Stable Common SM90 Build =========================== #
+add_library(common_ops_stable_sm90_build MODULE ${STABLE_SOURCES})
+target_compile_options(common_ops_stable_sm90_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+)
+target_compile_definitions(common_ops_stable_sm90_build PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA
+)
+target_include_directories(common_ops_stable_sm90_build PRIVATE ${INCLUDES})
+target_link_libraries(common_ops_stable_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+set_target_properties(common_ops_stable_sm90_build PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "common_ops_stable"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+)
+
+# ======================= Stable Common SM100+ Build ========================= #
+add_library(common_ops_stable_sm100_build MODULE ${STABLE_SOURCES})
+target_compile_options(common_ops_stable_sm100_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+)
+target_compile_definitions(common_ops_stable_sm100_build PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA
+)
+target_include_directories(common_ops_stable_sm100_build PRIVATE ${INCLUDES})
+target_link_libraries(common_ops_stable_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+set_target_properties(common_ops_stable_sm100_build PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "common_ops_stable"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+)
+
+install(TARGETS common_ops_stable_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+install(TARGETS common_ops_stable_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file

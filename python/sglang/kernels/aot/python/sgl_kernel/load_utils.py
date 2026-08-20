@@ -2,6 +2,7 @@ import ctypes
 import glob
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import List
@@ -9,6 +10,24 @@ from typing import List
 import torch
 
 logger = logging.getLogger(__name__)
+
+_MIN_STABLE_TORCH_VERSION = (2, 11)
+
+
+def _check_stable_torch_runtime():
+    """Require the minimum runtime that exports the stable APIs we build against."""
+    match = re.match(r"^(\d+)\.(\d+)", str(torch.__version__))
+    if match is None:
+        raise RuntimeError(
+            f"sgl-kernel could not determine the PyTorch runtime version from {torch.__version__!r}"
+        )
+
+    runtime_version = tuple(map(int, match.groups()))
+    if runtime_version < _MIN_STABLE_TORCH_VERSION:
+        raise RuntimeError(
+            "sgl-kernel's stable CUDA operators require PyTorch >= 2.11 at "
+            f"runtime; found {torch.__version__}"
+        )
 
 
 def _get_compute_capability():
@@ -88,7 +107,7 @@ def _load_architecture_specific_ops():
             torch.ops.load_library(str(ops_path))
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
             logger.debug(f"[sgl_kernel] ✓ Library file: {ops_path}")
-            return
+            return ops_path
 
         except Exception as e:
             previous_import_errors.append(e)
@@ -117,7 +136,7 @@ def _load_architecture_specific_ops():
             torch.ops.load_library(str(alt_path))
             logger.debug("[sgl_kernel] ✓ Successfully loaded fallback library")
             logger.debug(f"[sgl_kernel] ✓ Library file: {alt_path}")
-            return
+            return alt_path
 
         except Exception as e:
             previous_import_errors.append(e)
@@ -162,6 +181,29 @@ Error details from previous import attempts:
 """
     logger.debug(error_msg)
     raise ImportError(error_msg)
+
+
+def _load_stable_ops(common_ops_path: Path):
+    """Load the stable common ops library next to the selected legacy library."""
+    ops_pattern = str(common_ops_path.parent / "common_ops_stable.*")
+    raw_matching_files = glob.glob(ops_pattern)
+    matching_files = _filter_compiled_extensions(raw_matching_files)
+
+    logger.debug(
+        f"[sgl_kernel] Looking for stable library matching pattern: {ops_pattern}"
+    )
+    logger.debug(f"[sgl_kernel] Found stable files: {raw_matching_files}")
+
+    if not matching_files:
+        raise ImportError(
+            f"[sgl_kernel] Could not find common_ops_stable next to {common_ops_path}"
+        )
+
+    ops_path = Path(matching_files[0])
+    logger.debug(f"[sgl_kernel] Loading stable ops library from {ops_path}...")
+    torch.ops.load_library(str(ops_path))
+    logger.debug("[sgl_kernel] ✓ Successfully loaded stable common ops")
+    logger.debug(f"[sgl_kernel] ✓ Library file: {ops_path}")
 
 
 # copy & modify from torch/utils/cpp_extension.py
