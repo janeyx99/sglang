@@ -251,14 +251,26 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
-# All source files
-# NOTE: Please sort the filenames alphabetically
-set(SOURCES
+# Common extension module initialization
+set(COMMON_EXTENSION_SOURCES
+    "csrc/common_extension.cc"
+)
+
+# Source families are kept independent so each family can migrate separately.
+# NOTE: Please sort the filenames alphabetically within each family.
+set(ALLREDUCE_SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/registration/allreduce_ops.cc"
+)
+
+set(ATTENTION_SOURCES
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
-    "csrc/common_extension.cc"
+    "csrc/registration/attention_ops.cc"
+)
+
+set(ELEMENTWISE_SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
@@ -266,51 +278,112 @@ set(SOURCES
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
+    "csrc/registration/elementwise_ops.cc"
+)
+
+set(EXPERT_SPECIALIZATION_SOURCES
     "csrc/expert_specialization/es_fp8_blockwise.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
+    "csrc/registration/expert_specialization_ops.cc"
+)
 
+set(GEMM_SOURCES
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
+    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
-    "csrc/gemm/gptq/gptq_kernel.cu"
+    "csrc/registration/gemm_ops.cc"
+)
+
+set(GRAMMAR_SOURCES
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/registration/grammar_ops.cc"
+)
 
+set(INFLLM_V2_SOURCES
     "csrc/infllm_v2/max_pooling.cu"
+    "csrc/registration/infllm_v2_ops.cc"
+)
 
+set(KVCACHEIO_SOURCES
     "csrc/kvcacheio/transfer.cu"
-    "csrc/mamba/causal_conv1d.cu"
-    "csrc/memory/weak_ref_tensor.cpp"
+    "csrc/registration/kvcacheio_ops.cc"
+)
 
+set(MAMBA_SOURCES
+    "csrc/mamba/causal_conv1d.cu"
+    "csrc/registration/mamba_ops.cc"
+)
+
+set(MEMORY_SOURCES
+    "csrc/memory/weak_ref_tensor.cpp"
+    "csrc/registration/memory_ops.cc"
+)
+
+set(MOE_SOURCES
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/moe/moe_align_kernel.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
+    "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
-    "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/prepare_moe_input.cu"
+    "csrc/registration/moe_ops.cc"
+)
 
+set(QUANTIZATION_SOURCES
     "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/registration/quantization_ops.cc"
+)
+
+set(SPECULATIVE_SOURCES
+    "csrc/registration/speculative_ops.cc"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
+)
 
+set(FLASHINFER_SOURCES
+    "csrc/registration/flashinfer_ops.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
+)
 
+set(SPARSE_ATTENTION_SOURCES
+    "csrc/registration/sparse_attention_ops.cc"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
+)
+
+set(SOURCES
+    ${ALLREDUCE_SOURCES}
+    ${ATTENTION_SOURCES}
+    ${COMMON_EXTENSION_SOURCES}
+    ${ELEMENTWISE_SOURCES}
+    ${EXPERT_SPECIALIZATION_SOURCES}
+    ${GEMM_SOURCES}
+    ${GRAMMAR_SOURCES}
+    ${INFLLM_V2_SOURCES}
+    ${KVCACHEIO_SOURCES}
+    ${MAMBA_SOURCES}
+    ${MEMORY_SOURCES}
+    ${MOE_SOURCES}
+    ${QUANTIZATION_SOURCES}
+    ${SPECULATIVE_SOURCES}
+    ${FLASHINFER_SOURCES}
+    ${SPARSE_ATTENTION_SOURCES}
 )
 
 set(INCLUDES

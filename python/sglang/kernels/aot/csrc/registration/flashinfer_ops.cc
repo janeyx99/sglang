@@ -18,4 +18,10 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-REGISTER_EXTENSION(common_ops)
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
+  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
+
+  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
+  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
+}

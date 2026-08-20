@@ -18,4 +18,10 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-REGISTER_EXTENSION(common_ops)
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def(
+      "infllm_v2_max_pooling_1d_varlen(Tensor input, Tensor! output, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
+      "Tensor cache_lens, int max_seqlen_q, int max_seqlen_k, int kernel_size, int stride, int padding, "
+      "int block_size, int local_blocks, int init_blocks, int total_q) -> ()");
+  m.impl("infllm_v2_max_pooling_1d_varlen", torch::kCUDA, &infllm_v2_max_pooling_1d_varlen);
+}

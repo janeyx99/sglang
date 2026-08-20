@@ -18,4 +18,7 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-REGISTER_EXTENSION(common_ops)
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+}

@@ -18,4 +18,7 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-REGISTER_EXTENSION(common_ops)
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
+  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+}
