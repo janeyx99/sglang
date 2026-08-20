@@ -1,11 +1,33 @@
 // Adapted from
 // https://github.com/vllm-project/vllm/blob/014ece97c7aa49084a1119dca792af081a18dbc1/csrc/pos_encoding_kernels.cu
 
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_runtime.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Dispatch.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+
+#include <algorithm>
+#include <optional>
+
+#include "elementwise/elementwise_ops.h"
+#include "sgl_kernel_cuda_stream.h"
+
+#define SGLANG_LDG(arg) __ldg(arg)
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
 #include "utils.h"
+#endif
 
 template <typename scalar_t, bool IS_NEOX>
 inline __device__ void apply_token_rotary_embedding(
@@ -116,6 +138,118 @@ __global__ void rotary_embedding_kernel(
       head_stride);
 }
 
+#ifdef TORCH_TARGET_VERSION
+#define STABLE_DISPATCH_FLOAT_TYPES(TYPE, NAME, ...)                                                     \
+  THO_DISPATCH_SWITCH(                                                                                   \
+      TYPE,                                                                                              \
+      NAME,                                                                                              \
+      THO_DISPATCH_CASE(ScalarType::Float, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::Half, __VA_ARGS__) \
+          THO_DISPATCH_CASE(ScalarType::BFloat16, __VA_ARGS__))
+
+void rotary_embedding(
+    Tensor& positions,  // [batch_size, seq_len] or [num_tokens]
+    Tensor& query,      // [batch_size, seq_len, num_heads * head_size] or
+                        // [num_tokens, num_heads * head_size] or
+                        // [batch_size, seq_len, num_heads, head_size] or
+                        // [num_tokens, num_heads, head_size]
+    std::optional<Tensor> key,
+    // null or
+    // [batch_size, seq_len, num_kv_heads * head_size] or
+    // [num_tokens, num_kv_heads * head_size] or
+    // [batch_size, seq_len, num_heads, head_size] or
+    // [num_tokens, num_heads, head_size]
+    int64_t head_size,
+    Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    bool is_neox) {
+  // num_tokens = batch_size * seq_len
+  int64_t num_tokens = positions.numel();
+  int positions_ndim = positions.dim();
+
+  // Make sure num_tokens dim is consistent across positions, query, and key
+  STD_TORCH_CHECK(
+      positions_ndim == 1 || positions_ndim == 2, "positions must have shape [num_tokens] or [batch_size, seq_len]");
+  if (positions_ndim == 1) {
+    STD_TORCH_CHECK(
+        query.size(0) == positions.size(0) && (!key.has_value() || key->size(0) == positions.size(0)),
+        "query, key and positions must have the same number of tokens");
+  }
+  if (positions_ndim == 2) {
+    STD_TORCH_CHECK(
+        query.size(0) == positions.size(0) && (!key.has_value() || key->size(0) == positions.size(0)) &&
+            query.size(1) == positions.size(1) && (!key.has_value() || key->size(1) == positions.size(1)),
+        "query, key and positions must have the same batch_size and seq_len");
+  }
+
+  // Make sure head_size is valid for query and key
+  // hidden_size = num_heads * head_size
+  int query_hidden_size = query.numel() / num_tokens;
+  int key_hidden_size = key.has_value() ? key->numel() / num_tokens : 0;
+  STD_TORCH_CHECK(
+      query_hidden_size % head_size == 0,
+      "Expected query_hidden_size % head_size == 0 to be true, but got false.  "
+      "(Could this error message be improved?  If so, please report an enhancement request to PyTorch.)");
+  STD_TORCH_CHECK(
+      key_hidden_size % head_size == 0,
+      "Expected key_hidden_size % head_size == 0 to be true, but got false.  "
+      "(Could this error message be improved?  If so, please report an enhancement request to PyTorch.)");
+
+  // Make sure query and key have consistent number of heads
+  int num_heads = query_hidden_size / head_size;
+  int num_kv_heads = key.has_value() ? key_hidden_size / head_size : num_heads;
+  STD_TORCH_CHECK(
+      num_heads % num_kv_heads == 0,
+      "Expected num_heads % num_kv_heads == 0 to be true, but got false.  "
+      "(Could this error message be improved?  If so, please report an enhancement request to PyTorch.)");
+
+  int rot_dim = cos_sin_cache.size(1);
+  int seq_dim_idx = positions_ndim - 1;
+  int64_t query_stride = query.stride(seq_dim_idx);
+  int64_t key_stride = key.has_value() ? key->stride(seq_dim_idx) : 0;
+  // Determine head stride: for [*, heads, head_size] use stride of last dim;
+  // for flat [*, heads*head_size], heads blocks are contiguous of size
+  // head_size
+  int query_ndim = query.dim();
+  int64_t head_stride = (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
+  STD_TORCH_CHECK(query.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  const torch::stable::accelerator::DeviceGuard device_guard(query.get_device_index());
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream();
+  STABLE_DISPATCH_FLOAT_TYPES(query.scalar_type(), "rotary_embedding", [&] {
+    if (is_neox) {
+      rotary_embedding_kernel<scalar_t, true><<<grid, block, 0, stream>>>(
+          positions.const_data_ptr<int64_t>(),
+          query.mutable_data_ptr<scalar_t>(),
+          key.has_value() ? key->mutable_data_ptr<scalar_t>() : nullptr,
+          cos_sin_cache.const_data_ptr<scalar_t>(),
+          rot_dim,
+          query_stride,
+          key_stride,
+          head_stride,
+          num_heads,
+          num_kv_heads,
+          head_size);
+    } else {
+      rotary_embedding_kernel<scalar_t, false><<<grid, block, 0, stream>>>(
+          positions.const_data_ptr<int64_t>(),
+          query.mutable_data_ptr<scalar_t>(),
+          key.has_value() ? key->mutable_data_ptr<scalar_t>() : nullptr,
+          cos_sin_cache.const_data_ptr<scalar_t>(),
+          rot_dim,
+          query_stride,
+          key_stride,
+          head_stride,
+          num_heads,
+          num_kv_heads,
+          head_size);
+    }
+  });
+}
+
+#undef STABLE_DISPATCH_FLOAT_TYPES
+#undef SGLANG_LDG
+#else
 void rotary_embedding(
     torch::Tensor& positions,  // [batch_size, seq_len] or [num_tokens]
     torch::Tensor& query,      // [batch_size, seq_len, num_heads * head_size] or
@@ -206,3 +340,4 @@ void rotary_embedding(
     }
   });
 }
+#endif

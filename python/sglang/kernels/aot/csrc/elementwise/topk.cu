@@ -6,11 +6,42 @@
  * 2. optimize the performance a little
  * 3. fix the potential illegal memory access
  */
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/macros/Macros.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include "elementwise/elementwise_ops.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+
+#define SGL_CHECK(condition, ...) STD_TORCH_CHECK(condition, __VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition)                                                                   \
+  STD_TORCH_CHECK(                                                                                    \
+      condition,                                                                                      \
+      "Expected " #condition                                                                          \
+      " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+      "enhancement request to PyTorch.)")
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define ELEM_MUTABLE_DATA_PTR(tensor, type) tensor.mutable_data_ptr<type>()
+#define ELEM_READ_DATA_PTR(tensor, type) tensor.const_data_ptr<type>()
+#else
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+
+using Tensor = at::Tensor;
+
+#define SGL_CHECK(condition, ...) TORCH_CHECK(condition, __VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition) TORCH_CHECK(condition)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream().stream()
+#define ELEM_MUTABLE_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define ELEM_READ_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#endif
+
 #include <cuda.h>
 #include <cuda_fp16.h>
 
@@ -381,33 +412,33 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
 }
 
 auto get_params(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> indices_opt = std::nullopt) -> FastTopKParams {
+    const Tensor& score,
+    const Tensor& lengths,
+    std::optional<Tensor> row_starts_opt = std::nullopt,
+    std::optional<Tensor> indices_opt = std::nullopt) -> FastTopKParams {
   const auto B = score.size(0);
-  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1);
+  SGL_CHECK_NO_MSG(score.dim() == 2 && score.stride(1) == 1);
   if (row_starts_opt.has_value()) {
     const auto& row_starts = row_starts_opt.value();
-    TORCH_CHECK(row_starts.dim() == 1);
-    TORCH_CHECK(row_starts.size(0) == B);
+    SGL_CHECK_NO_MSG(row_starts.dim() == 1);
+    SGL_CHECK_NO_MSG(row_starts.size(0) == B);
   }
-  TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous());
-  TORCH_CHECK(lengths.size(0) == B);
+  SGL_CHECK_NO_MSG(lengths.dim() == 1 && lengths.is_contiguous());
+  SGL_CHECK_NO_MSG(lengths.size(0) == B);
   int32_t* indices_data_ptr = nullptr;
   if (indices_opt.has_value()) {
     const auto& indices = indices_opt.value();
-    TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
-    TORCH_CHECK(indices.size(0) == B);
-    TORCH_CHECK(indices.size(1) == TopK);
-    indices_data_ptr = indices.data_ptr<int32_t>();
+    SGL_CHECK_NO_MSG(indices.dim() == 2 && indices.is_contiguous());
+    SGL_CHECK_NO_MSG(indices.size(0) == B);
+    SGL_CHECK_NO_MSG(indices.size(1) == TopK);
+    indices_data_ptr = ELEM_MUTABLE_DATA_PTR(indices, int32_t);
   }
 
   return FastTopKParams{
-      .input = score.data_ptr<float>(),
-      .row_starts = row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
+      .input = ELEM_READ_DATA_PTR(score, float),
+      .row_starts = row_starts_opt.has_value() ? ELEM_READ_DATA_PTR(row_starts_opt.value(), int32_t) : nullptr,
       .indices = indices_data_ptr,
-      .lengths = lengths.data_ptr<int32_t>(),
+      .lengths = const_cast<int32_t*>(ELEM_READ_DATA_PTR(lengths, int32_t)),
       .input_stride = score.stride(0),
   };
 }
@@ -427,15 +458,15 @@ void setup_kernel_smem_once() {
     return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #endif
   }();
-  TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+  SGL_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 
 }  // namespace
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CUDA(x) SGL_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
 void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
+    const Tensor& score, Tensor& indices, const Tensor& lengths, std::optional<Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(indices);
   if (row_starts_opt.has_value()) {
@@ -444,22 +475,22 @@ void fast_topk_interface(
   CHECK_CUDA(lengths);
   const auto params = get_params(score, lengths, row_starts_opt, indices);
   const auto B = score.size(0);
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto stream = SGL_CURRENT_CUDA_STREAM();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
   setup_kernel_smem_once<topk_kernel, kSmem>();
   topk_kernel<<<grid, block, kSmem, stream>>>(params);
   const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  SGL_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
 
 void fast_topk_transform_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    at::Tensor& dst_page_table,
-    const at::Tensor& src_page_table,
-    const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt) {
+    const Tensor& score,
+    const Tensor& lengths,
+    Tensor& dst_page_table,
+    const Tensor& src_page_table,
+    const Tensor& cu_seqlens_q,
+    std::optional<Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_page_table);
@@ -470,17 +501,17 @@ void fast_topk_transform_interface(
   }
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
-  TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
-  TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
-  TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
+  SGL_CHECK_NO_MSG(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
+  SGL_CHECK_NO_MSG(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
+  SGL_CHECK_NO_MSG(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
   const auto prefill_bs = cu_seqlens_q.size(0) - 1;
-  TORCH_CHECK(dst_page_table.size(0) == B);
-  TORCH_CHECK(dst_page_table.size(1) == TopK);
-  TORCH_CHECK(src_page_table.size(0) == prefill_bs);
-  TORCH_CHECK(prefill_bs <= B);  // prefill_bs should be smaller than expanded bs
+  SGL_CHECK_NO_MSG(dst_page_table.size(0) == B);
+  SGL_CHECK_NO_MSG(dst_page_table.size(1) == TopK);
+  SGL_CHECK_NO_MSG(src_page_table.size(0) == prefill_bs);
+  SGL_CHECK_NO_MSG(prefill_bs <= B);  // prefill_bs should be smaller than expanded bs
 
   // launch kernel
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto stream = SGL_CURRENT_CUDA_STREAM();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
   const auto src_stride = src_page_table.stride(0);
@@ -493,28 +524,31 @@ void fast_topk_transform_interface(
   if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+        params,
+        ELEM_MUTABLE_DATA_PTR(dst_page_table, int32_t),
+        ELEM_READ_DATA_PTR(src_page_table, int32_t),
+        src_stride);
   } else {
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
     topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
         params,
-        dst_page_table.data_ptr<int32_t>(),
-        src_page_table.data_ptr<int32_t>(),
+        ELEM_MUTABLE_DATA_PTR(dst_page_table, int32_t),
+        ELEM_READ_DATA_PTR(src_page_table, int32_t),
         src_stride,
-        cu_seqlens_q.data_ptr<int32_t>(),
+        ELEM_READ_DATA_PTR(cu_seqlens_q, int32_t),
         prefill_bs);
   }
 
   const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  SGL_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
 
 void fast_topk_transform_ragged_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
-    const at::Tensor& topk_indices_offset,
-    std::optional<at::Tensor> row_starts_opt) {
+    const Tensor& score,
+    const Tensor& lengths,
+    Tensor& topk_indices_ragged,
+    const Tensor& topk_indices_offset,
+    std::optional<Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(topk_indices_ragged);
@@ -525,22 +559,29 @@ void fast_topk_transform_ragged_interface(
 
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
-  TORCH_CHECK(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
-  TORCH_CHECK(topk_indices_offset.dim() == 1);
+  SGL_CHECK_NO_MSG(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
+  SGL_CHECK_NO_MSG(topk_indices_offset.dim() == 1);
 
-  TORCH_CHECK(topk_indices_ragged.size(0) == B);
-  TORCH_CHECK(topk_indices_ragged.size(1) == TopK);
-  TORCH_CHECK(topk_indices_offset.size(0) == B);
+  SGL_CHECK_NO_MSG(topk_indices_ragged.size(0) == B);
+  SGL_CHECK_NO_MSG(topk_indices_ragged.size(1) == TopK);
+  SGL_CHECK_NO_MSG(topk_indices_offset.size(0) == B);
 
   // launch kernel
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto stream = SGL_CURRENT_CUDA_STREAM();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
 
   setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
   topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
-      params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+      params, ELEM_MUTABLE_DATA_PTR(topk_indices_ragged, int32_t), ELEM_READ_DATA_PTR(topk_indices_offset, int32_t));
 
   const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  SGL_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
+
+#undef CHECK_CUDA
+#undef SGL_CHECK
+#undef SGL_CHECK_NO_MSG
+#undef SGL_CURRENT_CUDA_STREAM
+#undef ELEM_MUTABLE_DATA_PTR
+#undef ELEM_READ_DATA_PTR

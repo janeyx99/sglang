@@ -1,8 +1,13 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
+#include <cuda_runtime.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include <vector>
+
+#include "elementwise/elementwise_ops.h"
+#include "sgl_kernel_cuda_stream.h"
 
 template <int N>
 struct InputArray {
@@ -18,34 +23,36 @@ __global__ void copy_to_gpu_no_ce_kernel(const InputArray<N> input_array, int* o
 }
 
 template <int N>
-void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
-  TORCH_CHECK(input.dim() == 1, "input must be 1-D");
-  TORCH_CHECK(static_cast<int>(input.numel()) == N, "input numel must equal template N");
-  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-  TORCH_CHECK(input.dtype() == torch::kInt32, "input dtype must be int32");
+void copy_to_gpu_no_ce_impl(const torch::stable::Tensor& input, torch::stable::Tensor& output) {
+  using torch::headeronly::ScalarType;
 
-  TORCH_CHECK(output.dim() == 1, "output dim");
-  TORCH_CHECK(static_cast<int>(output.numel()) == N, "output size");
-  TORCH_CHECK(output.is_contiguous(), "output contiguous");
-  TORCH_CHECK(output.dtype() == torch::kInt32, "output dtype");
+  STD_TORCH_CHECK(input.dim() == 1, "input must be 1-D");
+  STD_TORCH_CHECK(static_cast<int>(input.numel()) == N, "input numel must equal template N");
+  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  STD_TORCH_CHECK(input.scalar_type() == ScalarType::Int, "input dtype must be int32");
 
-  TORCH_CHECK(input.device().is_cpu(), "input must be a CPU tensor");
-  TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
+  STD_TORCH_CHECK(output.dim() == 1, "output dim");
+  STD_TORCH_CHECK(static_cast<int>(output.numel()) == N, "output size");
+  STD_TORCH_CHECK(output.is_contiguous(), "output contiguous");
+  STD_TORCH_CHECK(output.scalar_type() == ScalarType::Int, "output dtype");
+
+  STD_TORCH_CHECK(input.is_cpu(), "input must be a CPU tensor");
+  STD_TORCH_CHECK(output.is_cuda(), "output must be a CUDA tensor");
 
   InputArray<N> input_array;
-  const int* input_ptr = input.data_ptr<int>();
+  const int* input_ptr = input.const_data_ptr<int>();
   for (int i = 0; i < N; ++i)
     input_array.values[i] = input_ptr[i];
 
   // may use multi thread blocks if performance bottleneck
   dim3 grid(1);
   dim3 block(static_cast<int>(input.numel()));
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream();
+  copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.mutable_data_ptr<int>());
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
+void copy_to_gpu_no_ce(const torch::stable::Tensor& input, torch::stable::Tensor& output) {
   int N = static_cast<int>(input.numel());
   // Can use macro if there are more N needed
   if (N == 72) {
@@ -55,6 +62,6 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
   } else if (N == 32) {
     copy_to_gpu_no_ce_impl<32>(input, output);
   } else {
-    TORCH_CHECK(false, "unexpected N");
+    STD_TORCH_CHECK(false, "unexpected N");
   }
 }
