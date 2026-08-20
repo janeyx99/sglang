@@ -14,7 +14,41 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "speculative/speculative_ops.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include "sgl_kernel_cuda_stream.h"
+
+#define CHECK_CUDA(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_DIM(d, x) STD_TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+#define CHECK_EQ(a, b) STD_TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+#define CHECK_GE(a, b) STD_TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
+#define SGL_KERNEL_DTYPE_CHECK(condition, message) STD_TORCH_CHECK(condition, message)
+#define SGL_KERNEL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#else
 #include "pytorch_extension_utils.h"
+
+#define SGL_KERNEL_DTYPE_CHECK(condition, message) \
+  do {                                             \
+    if (!(condition)) {                            \
+      throw std::runtime_error(message);           \
+    }                                              \
+  } while (false)
+#define SGL_KERNEL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#endif
+
+using Tensor = SglTensor;
+using ScalarType = SglScalarType;
+
+#define SPEC_MUTABLE_DATA_PTR(tensor, type) static_cast<type*>(SGL_MUTABLE_DATA_PTR(tensor))
+#define SPEC_READ_DATA_PTR(tensor, type) const_cast<type*>(static_cast<const type*>(SGL_CONST_DATA_PTR(tensor)))
+
+#include <string>
+
 #include "speculative_sampling.cuh"
 
 using namespace flashinfer;
@@ -29,20 +63,24 @@ using namespace flashinfer;
 // uniform_samples: [bs, num_draft_tokens]
 // target_probs: [bs, num_draft_tokens, vocab_size]
 void tree_speculative_sampling_target_only(
-    at::Tensor predicts,
-    at::Tensor accept_index,
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor uniform_samples,
-    at::Tensor uniform_samples_for_final_sampling,
-    at::Tensor target_probs,
-    at::Tensor draft_probs,
+    Tensor predicts,
+    Tensor accept_index,
+    Tensor accept_token_num,  // mutable
+    Tensor candidates,
+    Tensor retrive_index,
+    Tensor retrive_next_token,
+    Tensor retrive_next_sibling,
+    Tensor uniform_samples,
+    Tensor uniform_samples_for_final_sampling,
+    Tensor target_probs,
+    Tensor draft_probs,
     double threshold_single,
     double threshold_acc,
-    bool deterministic = true) {
+    bool deterministic
+#ifndef TORCH_TARGET_VERSION
+    = true
+#endif
+) {
   CHECK_INPUT(candidates);
   CHECK_INPUT(retrive_index);
   CHECK_INPUT(retrive_next_token);
@@ -50,6 +88,27 @@ void tree_speculative_sampling_target_only(
   CHECK_INPUT(uniform_samples);
   CHECK_INPUT(uniform_samples_for_final_sampling);
   CHECK_INPUT(target_probs);
+#ifdef TORCH_TARGET_VERSION
+  const auto device_index = target_probs.get_device_index();
+  const auto check_device = [device_index](const Tensor& tensor, const char* expression) {
+    const auto tensor_device_index = tensor.get_device_index();
+    STD_TORCH_CHECK(
+        tensor_device_index == device_index,
+        "CHECK_EQ(",
+        expression,
+        ") failed. cuda:",
+        tensor_device_index,
+        " vs cuda:",
+        device_index);
+  };
+  check_device(candidates, "candidates.device(), device");
+  check_device(retrive_index, "retrive_index.device(), device");
+  check_device(retrive_next_token, "retrive_next_token.device(), device");
+  check_device(retrive_next_sibling, "retrive_next_sibling.device(), device");
+  check_device(uniform_samples, "uniform_samples.device(), device");
+  check_device(uniform_samples_for_final_sampling, "uniform_samples_for_final_sampling.device(), device");
+  check_device(target_probs, "target_probs.device(), device");
+#else
   auto device = target_probs.device();
   CHECK_EQ(candidates.device(), device);
   CHECK_EQ(retrive_index.device(), device);
@@ -58,6 +117,7 @@ void tree_speculative_sampling_target_only(
   CHECK_EQ(uniform_samples.device(), device);
   CHECK_EQ(uniform_samples_for_final_sampling.device(), device);
   CHECK_EQ(target_probs.device(), device);
+#endif
   CHECK_DIM(1, predicts);
   CHECK_DIM(2, accept_index);
   CHECK_DIM(1, accept_token_num);
@@ -85,57 +145,55 @@ void tree_speculative_sampling_target_only(
   CHECK_EQ(vocab_size, target_probs.size(2));
   CHECK_EQ(batch_size, accept_index.size(0));
   CHECK_EQ(batch_size, accept_token_num.size(0));
-  if (predicts.scalar_type() != at::kInt) {
-    throw std::runtime_error("Expected 'predicts' to be of type int (torch.int32).");
-  }
-  if (accept_index.scalar_type() != at::kInt) {
-    throw std::runtime_error("Expected 'accept_index' to be of type int (torch.int32).");
-  }
-  if (accept_token_num.scalar_type() != at::kInt) {
-    throw std::runtime_error("Expected 'accept_token_num' to be of type int (torch.int32).");
-  }
-  if (candidates.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'candidates' to be of type long (torch.int64).");
-  }
-  if (retrive_index.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_index' to be of type long (torch.int64).");
-  }
-  if (retrive_next_token.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_next_token' to be of type long (torch.int64).");
-  }
-  if (retrive_next_sibling.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_next_sibling' to be of type long (torch.int64).");
-  }
-  if (uniform_samples.scalar_type() != at::kFloat) {
-    throw std::runtime_error("Expected 'uniform_samples' to be of type float (torch.float32).");
-  }
-  if (uniform_samples_for_final_sampling.scalar_type() != at::kFloat) {
-    throw std::runtime_error("Expected 'uniform_samples_for_final_sampling' to be of type float (torch.float32).");
-  }
-  if (target_probs.scalar_type() != at::kFloat) {
-    throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
-  }
-  if (draft_probs.scalar_type() != at::kFloat) {
-    throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
-  }
+  SGL_KERNEL_DTYPE_CHECK(
+      predicts.scalar_type() == ScalarType::Int, "Expected 'predicts' to be of type int (torch.int32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      accept_index.scalar_type() == ScalarType::Int, "Expected 'accept_index' to be of type int (torch.int32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      accept_token_num.scalar_type() == ScalarType::Int,
+      "Expected 'accept_token_num' to be of type int (torch.int32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      candidates.scalar_type() == ScalarType::Long, "Expected 'candidates' to be of type long (torch.int64).");
+  SGL_KERNEL_DTYPE_CHECK(
+      retrive_index.scalar_type() == ScalarType::Long, "Expected 'retrive_index' to be of type long (torch.int64).");
+  SGL_KERNEL_DTYPE_CHECK(
+      retrive_next_token.scalar_type() == ScalarType::Long,
+      "Expected 'retrive_next_token' to be of type long (torch.int64).");
+  SGL_KERNEL_DTYPE_CHECK(
+      retrive_next_sibling.scalar_type() == ScalarType::Long,
+      "Expected 'retrive_next_sibling' to be of type long (torch.int64).");
+  SGL_KERNEL_DTYPE_CHECK(
+      uniform_samples.scalar_type() == ScalarType::Float,
+      "Expected 'uniform_samples' to be of type float (torch.float32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      uniform_samples_for_final_sampling.scalar_type() == ScalarType::Float,
+      "Expected 'uniform_samples_for_final_sampling' to be of type float (torch.float32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      target_probs.scalar_type() == ScalarType::Float, "Expected 'target_probs' to be of type float (torch.float32).");
+  SGL_KERNEL_DTYPE_CHECK(
+      draft_probs.scalar_type() == ScalarType::Float, "Expected 'target_probs' to be of type float (torch.float32).");
   CHECK_GE(threshold_single, 0);
   CHECK_GE(1, threshold_single);
   CHECK_GE(threshold_acc, 0);
   CHECK_GE(1, threshold_acc);
 
+#ifdef TORCH_TARGET_VERSION
+  cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream();
+#else
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#endif
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
-      static_cast<int32_t*>(predicts.data_ptr()),
-      static_cast<int32_t*>(accept_index.data_ptr()),
-      static_cast<int32_t*>(accept_token_num.data_ptr()),
-      static_cast<int64_t*>(candidates.data_ptr()),
-      static_cast<int64_t*>(retrive_index.data_ptr()),
-      static_cast<int64_t*>(retrive_next_token.data_ptr()),
-      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
-      static_cast<float*>(uniform_samples.data_ptr()),
-      static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
-      static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
+      SPEC_MUTABLE_DATA_PTR(predicts, int32_t),
+      SPEC_MUTABLE_DATA_PTR(accept_index, int32_t),
+      SPEC_MUTABLE_DATA_PTR(accept_token_num, int32_t),
+      SPEC_READ_DATA_PTR(candidates, int64_t),
+      SPEC_READ_DATA_PTR(retrive_index, int64_t),
+      SPEC_READ_DATA_PTR(retrive_next_token, int64_t),
+      SPEC_READ_DATA_PTR(retrive_next_sibling, int64_t),
+      SPEC_READ_DATA_PTR(uniform_samples, float),
+      SPEC_READ_DATA_PTR(uniform_samples_for_final_sampling, float),
+      SPEC_READ_DATA_PTR(target_probs, float),
+      SPEC_MUTABLE_DATA_PTR(draft_probs, float),
       batch_size,
       num_spec_step,
       num_draft_tokens,
@@ -145,7 +203,20 @@ void tree_speculative_sampling_target_only(
       deterministic,
       stream);
 
-  TORCH_CHECK(
+  SGL_KERNEL_CHECK(
       status == cudaSuccess,
       "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(cudaGetErrorString(status)));
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef CHECK_CUDA
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+#undef CHECK_DIM
+#undef CHECK_EQ
+#undef CHECK_GE
+#endif
+#undef SGL_KERNEL_DTYPE_CHECK
+#undef SGL_KERNEL_CHECK
+#undef SPEC_MUTABLE_DATA_PTR
+#undef SPEC_READ_DATA_PTR

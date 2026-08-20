@@ -1,3 +1,10 @@
+#include <cuda_runtime.h>
+
+#include "speculative/speculative_ops.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include "sgl_kernel_cuda_stream.h"
+#else
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -6,6 +13,30 @@
 #else
 #include "pytorch_extension_utils_rocm.h"
 #endif
+
+#endif
+
+using Tensor = SglTensor;
+
+namespace {
+
+inline const void* ConstDataPtr(const Tensor& tensor) {
+  return SGL_CONST_DATA_PTR(tensor);
+}
+
+inline void* MutableDataPtr(const Tensor& tensor) {
+  return SGL_MUTABLE_DATA_PTR(tensor);
+}
+
+inline cudaStream_t GetCurrentCUDAStream() {
+#ifdef TORCH_TARGET_VERSION
+  return sgl_kernel::stable::get_current_cuda_stream();
+#else
+  return at::cuda::getCurrentCUDAStream();
+#endif
+}
+
+}  // namespace
 
 // tree_mask: [bs * draft_token_num * draft_token_num]
 // verified_seq_len: [bs]
@@ -81,25 +112,25 @@ __global__ void reconstructIndicesFromTreeMask(
 }
 
 void reconstruct_indices_from_tree_mask(
-    at::Tensor tree_mask,
-    at::Tensor verified_seq_len,
-    at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    Tensor tree_mask,
+    Tensor verified_seq_len,
+    Tensor positions,
+    Tensor retrive_index,
+    Tensor retrive_next_token,
+    Tensor retrive_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num) {
   dim3 grid(batch_size);
   dim3 block(draft_token_num);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = GetCurrentCUDAStream();
 
   reconstructIndicesFromTreeMask<<<grid, block, 0, stream>>>(
-      static_cast<bool*>(tree_mask.data_ptr()),
-      static_cast<int64_t*>(verified_seq_len.data_ptr()),
-      static_cast<int64_t*>(positions.data_ptr()),
-      static_cast<int64_t*>(retrive_index.data_ptr()),
-      static_cast<int64_t*>(retrive_next_token.data_ptr()),
-      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      const_cast<bool*>(static_cast<const bool*>(ConstDataPtr(tree_mask))),
+      const_cast<int64_t*>(static_cast<const int64_t*>(ConstDataPtr(verified_seq_len))),
+      static_cast<int64_t*>(MutableDataPtr(positions)),
+      static_cast<int64_t*>(MutableDataPtr(retrive_index)),
+      static_cast<int64_t*>(MutableDataPtr(retrive_next_token)),
+      static_cast<int64_t*>(MutableDataPtr(retrive_next_sibling)),
       int(batch_size),
       int(draft_token_num));
 }
