@@ -1,17 +1,28 @@
 // clang-format off
 // adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu
 // and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_update.cu
-#include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
 
 #include "causal_conv1d.h"
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
+#include "mamba/causal_conv1d_ops.h"
+#include "sgl_kernel_cuda_stream.h"
 
+#include <cstring>
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
+#include <optional>
+
+using torch::headeronly::BFloat16;
+using torch::headeronly::Half;
+using torch::headeronly::ScalarType;
+using torch::stable::Tensor;
 
 #define BOOL_SWITCH(COND, CONST_NAME, ...)                                           \
     [&] {                                                                            \
@@ -24,23 +35,35 @@
         }                                                                            \
     }()
 
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define STD_TORCH_CHECK_NO_MSG_TEXT(condition, condition_text)                                           \
+    STD_TORCH_CHECK(                                                                                    \
+        condition,                                                                                      \
+        "Expected " condition_text                                                                      \
+        " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+        "enhancement request to PyTorch.)")
+#define STD_TORCH_CHECK_NO_MSG(condition) STD_TORCH_CHECK_NO_MSG_TEXT(condition, #condition)
+
+#define CHECK_SHAPE(x, ...)                                                                            \
+    STD_TORCH_CHECK(                                                                                   \
+        x.sizes().equals(torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__})),                     \
+        #x " must have shape (" #__VA_ARGS__ ")")
 
 #define DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)              \
-    if (ITYPE == at::ScalarType::Half) {                                            \
-        using input_t = at::Half;                                                   \
-        using weight_t = at::Half;                                                  \
+    if (ITYPE == ScalarType::Half) {                                                \
+        using input_t = Half;                                                       \
+        using weight_t = Half;                                                      \
         __VA_ARGS__();                                                              \
-    } else if (ITYPE == at::ScalarType::BFloat16) {                                 \
-        using input_t = at::BFloat16;                                               \
-        using weight_t = at::BFloat16;                                              \
+    } else if (ITYPE == ScalarType::BFloat16) {                                     \
+        using input_t = BFloat16;                                                   \
+        using weight_t = BFloat16;                                                  \
         __VA_ARGS__();                                                              \
-    } else if (ITYPE == at::ScalarType::Float)  {                                   \
+    } else if (ITYPE == ScalarType::Float)  {                                       \
         using input_t = float;                                                      \
         using weight_t = float;                                                     \
         __VA_ARGS__();                                                              \
     } else {                                                                        \
-        AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
+        STD_TORCH_CHECK(                                                            \
+            false, #NAME, " not implemented for input type '", torch::headeronly::toString(ITYPE), "'"); \
     }
 
 
@@ -57,15 +80,15 @@ void set_conv_params_fwd(ConvParamsBase &params,
                          const size_t seqlen,
                          const size_t width,
                          // device pointers
-                         const at::Tensor x,
-                         const at::Tensor weight,
-                         const at::Tensor out,
-                         const std::optional<at::Tensor>& bias,
+                         const Tensor x,
+                         const Tensor weight,
+                         const Tensor out,
+                         const std::optional<Tensor>& bias,
                          bool silu_activation,
                          int64_t pad_slot_id,
-                         const std::optional<at::Tensor>& query_start_loc = std::nullopt,
-                         const std::optional<at::Tensor>& cache_indices = std::nullopt,
-                         const std::optional<at::Tensor>& has_initial_state = std::nullopt) {
+                         const std::optional<Tensor>& query_start_loc = std::nullopt,
+                         const std::optional<Tensor>& cache_indices = std::nullopt,
+                         const std::optional<Tensor>& has_initial_state = std::nullopt) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -79,14 +102,20 @@ void set_conv_params_fwd(ConvParamsBase &params,
     params.silu_activation = silu_activation;
 
     // Set the pointers and strides.
-    params.x_ptr = x.data_ptr();
-    params.weight_ptr = weight.data_ptr();
-    params.bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr;
-    params.out_ptr = out.data_ptr();
+    params.x_ptr = const_cast<void*>(x.const_data_ptr());
+    params.weight_ptr = const_cast<void*>(weight.const_data_ptr());
+    params.bias_ptr = bias.has_value() ? const_cast<void*>(bias.value().const_data_ptr()) : nullptr;
+    params.out_ptr = out.mutable_data_ptr();
     // All stride are in elements, not bytes.
-    params.query_start_loc_ptr = query_start_loc.has_value() ? query_start_loc.value().data_ptr() : nullptr;
-    params.cache_indices_ptr = cache_indices.has_value() ? cache_indices.value().data_ptr() : nullptr;
-    params.has_initial_state_ptr = has_initial_state.has_value() ? has_initial_state.value().data_ptr() : nullptr;
+    params.query_start_loc_ptr = query_start_loc.has_value()
+        ? const_cast<void*>(query_start_loc.value().const_data_ptr())
+        : nullptr;
+    params.cache_indices_ptr = cache_indices.has_value()
+        ? const_cast<void*>(cache_indices.value().const_data_ptr())
+        : nullptr;
+    params.has_initial_state_ptr = has_initial_state.has_value()
+        ? const_cast<void*>(has_initial_state.value().const_data_ptr())
+        : nullptr;
     const bool varlen = params.query_start_loc_ptr != nullptr;
     params.x_batch_stride = x.stride(varlen ? 1 : 0);
     params.x_c_stride = x.stride(varlen ? 0 : 1);
@@ -99,23 +128,29 @@ void set_conv_params_fwd(ConvParamsBase &params,
 }
 
 
-void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
-                  const std::optional<at::Tensor> &bias_,
-                  const std::optional<at::Tensor> &conv_states,
-                  const std::optional<at::Tensor> &query_start_loc,
-                  const std::optional<at::Tensor> &cache_indices,
-                  const std::optional<at::Tensor> &has_initial_state,
+void causal_conv1d_fwd(const Tensor &x, const Tensor &weight,
+                  const std::optional<Tensor> &bias_,
+                  const std::optional<Tensor> &conv_states,
+                  const std::optional<Tensor> &query_start_loc,
+                  const std::optional<Tensor> &cache_indices,
+                  const std::optional<Tensor> &has_initial_state,
                   bool silu_activation,
                  // used to identify padding entries if cache_indices provided
                  // in case of padding, the kernel will return early
                   int64_t pad_slot_id) {
     auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
-    TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half || weight_type == at::ScalarType::BFloat16);
+    STD_TORCH_CHECK_NO_MSG_TEXT(
+        input_type == ScalarType::Float || input_type == ScalarType::Half || input_type == ScalarType::BFloat16,
+        "input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == "
+        "at::ScalarType::BFloat16");
+    STD_TORCH_CHECK_NO_MSG_TEXT(
+        weight_type == ScalarType::Float || weight_type == ScalarType::Half || weight_type == ScalarType::BFloat16,
+        "weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half || weight_type == "
+        "at::ScalarType::BFloat16");
 
-    TORCH_CHECK(x.is_cuda());
-    TORCH_CHECK(weight.is_cuda());
+    STD_TORCH_CHECK_NO_MSG(x.is_cuda());
+    STD_TORCH_CHECK_NO_MSG(weight.is_cuda());
 
     const bool varlen = query_start_loc.has_value() ? true : false;
     const auto sizes = x.sizes();
@@ -135,36 +170,42 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
-        TORCH_CHECK(bias.scalar_type() == weight_type);
-        TORCH_CHECK(bias.is_cuda());
-        TORCH_CHECK(bias.stride(-1) == 1);
+        STD_TORCH_CHECK_NO_MSG(bias.scalar_type() == weight_type);
+        STD_TORCH_CHECK_NO_MSG(bias.is_cuda());
+        STD_TORCH_CHECK_NO_MSG(bias.stride(-1) == 1);
         CHECK_SHAPE(bias, dim);
     }
 
 
     if (has_initial_state.has_value()) {
         auto has_initial_state_ = has_initial_state.value();
-        TORCH_CHECK(has_initial_state_.scalar_type() == at::ScalarType::Bool);
-        TORCH_CHECK(has_initial_state_.is_cuda());
+        STD_TORCH_CHECK_NO_MSG_TEXT(
+            has_initial_state_.scalar_type() == ScalarType::Bool,
+            "has_initial_state_.scalar_type() == at::ScalarType::Bool");
+        STD_TORCH_CHECK_NO_MSG(has_initial_state_.is_cuda());
         CHECK_SHAPE(has_initial_state_, batch_size);
     }
 
 
     if (query_start_loc.has_value()) {
         auto query_start_loc_ = query_start_loc.value();
-        TORCH_CHECK(query_start_loc_.scalar_type() == at::ScalarType::Int);
-        TORCH_CHECK(query_start_loc_.is_cuda());
+        STD_TORCH_CHECK_NO_MSG_TEXT(
+            query_start_loc_.scalar_type() == ScalarType::Int,
+            "query_start_loc_.scalar_type() == at::ScalarType::Int");
+        STD_TORCH_CHECK_NO_MSG(query_start_loc_.is_cuda());
     }
 
 
     if (cache_indices.has_value()) {
         auto cache_indices_ = cache_indices.value();
-        TORCH_CHECK(cache_indices_.scalar_type() == at::ScalarType::Int);
-        TORCH_CHECK(cache_indices_.is_cuda());
+        STD_TORCH_CHECK_NO_MSG_TEXT(
+            cache_indices_.scalar_type() == ScalarType::Int,
+            "cache_indices_.scalar_type() == at::ScalarType::Int");
+        STD_TORCH_CHECK_NO_MSG(cache_indices_.is_cuda());
         CHECK_SHAPE(cache_indices_, batch_size);
     }
 
-    at::Tensor out = x;
+    Tensor out = x;
 
     ConvParamsBase params;
     set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, weight, out,
@@ -178,9 +219,9 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 
     if (conv_states.has_value()) {
         auto conv_states_ = conv_states.value();
-        TORCH_CHECK(conv_states_.scalar_type() == input_type);
-        TORCH_CHECK(conv_states_.is_cuda());
-        params.conv_states_ptr = conv_states_.data_ptr();
+        STD_TORCH_CHECK_NO_MSG(conv_states_.scalar_type() == input_type);
+        STD_TORCH_CHECK_NO_MSG(conv_states_.is_cuda());
+        params.conv_states_ptr = conv_states_.mutable_data_ptr();
         params.conv_states_batch_stride = conv_states_.stride(0);
         params.conv_states_c_stride = conv_states_.stride(-2);
         params.conv_states_l_stride = conv_states_.stride(-1);
@@ -189,35 +230,40 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x.get_device()};
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    torch::stable::accelerator::DeviceGuard device_guard(x.get_device_index());
+    auto stream = sgl_kernel::stable::get_current_cuda_stream(x.get_device_index());
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd", [&] {
             causal_conv1d_fwd_cuda<input_t, weight_t>(params, stream);
     });
 }
 
 
-void causal_conv1d_update(const at::Tensor &x,
-                     const at::Tensor &conv_state,
-                     const at::Tensor &weight,
-                     const std::optional<at::Tensor> &bias_,
+void causal_conv1d_update(const Tensor &x,
+                     const Tensor &conv_state,
+                     const Tensor &weight,
+                     const std::optional<Tensor> &bias_,
                      bool silu_activation,
-                     const std::optional<at::Tensor> &cache_seqlens_,
-                     const std::optional<at::Tensor> &conv_state_indices_,
+                     const std::optional<Tensor> &cache_seqlens_,
+                     const std::optional<Tensor> &conv_state_indices_,
                      // used to identify padding entries if cache_indices provided
                      // in case of padding, the kernel will return early
                      int64_t pad_slot_id) {
     auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
-    TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half || weight_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == input_type, "weight type must equal to input type, other variations are disabled due to binary size limitations");
-    TORCH_CHECK(conv_state.scalar_type() == input_type);
+    STD_TORCH_CHECK_NO_MSG_TEXT(
+        input_type == ScalarType::Float || input_type == ScalarType::Half || input_type == ScalarType::BFloat16,
+        "input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == "
+        "at::ScalarType::BFloat16");
+    STD_TORCH_CHECK_NO_MSG_TEXT(
+        weight_type == ScalarType::Float || weight_type == ScalarType::Half || weight_type == ScalarType::BFloat16,
+        "weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half || weight_type == "
+        "at::ScalarType::BFloat16");
+    STD_TORCH_CHECK(weight_type == input_type, "weight type must equal to input type, other variations are disabled due to binary size limitations");
+    STD_TORCH_CHECK_NO_MSG(conv_state.scalar_type() == input_type);
 
-    TORCH_CHECK(x.is_cuda());
-    TORCH_CHECK(conv_state.is_cuda());
-    TORCH_CHECK(weight.is_cuda());
+    STD_TORCH_CHECK_NO_MSG(x.is_cuda());
+    STD_TORCH_CHECK_NO_MSG(conv_state.is_cuda());
+    STD_TORCH_CHECK_NO_MSG(weight.is_cuda());
 
     const auto sizes = x.sizes();
     const int batch_size = sizes[0];
@@ -225,29 +271,29 @@ void causal_conv1d_update(const at::Tensor &x,
     const int seqlen = sizes[2];
     const int width = weight.size(-1);
     const int conv_state_len = conv_state.size(2);
-    TORCH_CHECK(conv_state_len >= width - 1);
+    STD_TORCH_CHECK_NO_MSG(conv_state_len >= width - 1);
 
     CHECK_SHAPE(x, batch_size, dim, seqlen);
     CHECK_SHAPE(weight, dim, width);
 
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    STD_TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
-        TORCH_CHECK(bias.scalar_type() == weight_type);
-        TORCH_CHECK(bias.is_cuda());
-        TORCH_CHECK(bias.stride(-1) == 1);
+        STD_TORCH_CHECK_NO_MSG(bias.scalar_type() == weight_type);
+        STD_TORCH_CHECK_NO_MSG(bias.is_cuda());
+        STD_TORCH_CHECK_NO_MSG(bias.stride(-1) == 1);
         CHECK_SHAPE(bias, dim);
     }
 
-    at::Tensor out = x;
+    Tensor out = x;
 
     ConvParamsBase params;
     set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, weight, out,
                         bias_,
                         silu_activation,
                         pad_slot_id);
-    params.conv_state_ptr = conv_state.data_ptr();
+    params.conv_state_ptr = conv_state.mutable_data_ptr();
     params.conv_state_len = conv_state_len;
     // All stride are in elements, not bytes.
     params.conv_state_batch_stride = conv_state.stride(0);
@@ -256,35 +302,38 @@ void causal_conv1d_update(const at::Tensor &x,
 
     if (cache_seqlens_.has_value()) {
         auto cache_seqlens = cache_seqlens_.value();
-        TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt32);
-        TORCH_CHECK(cache_seqlens.is_cuda());
-        TORCH_CHECK(cache_seqlens.stride(-1) == 1);
+        STD_TORCH_CHECK_NO_MSG_TEXT(
+            cache_seqlens.scalar_type() == ScalarType::Int,
+            "cache_seqlens.scalar_type() == torch::kInt32");
+        STD_TORCH_CHECK_NO_MSG(cache_seqlens.is_cuda());
+        STD_TORCH_CHECK_NO_MSG(cache_seqlens.stride(-1) == 1);
         CHECK_SHAPE(cache_seqlens, batch_size);
-        params.cache_seqlens = cache_seqlens.data_ptr<int32_t>();
+        params.cache_seqlens = const_cast<int32_t*>(cache_seqlens.const_data_ptr<int32_t>());
     } else {
         params.cache_seqlens = nullptr;
     }
 
     if (conv_state_indices_.has_value()) {
         auto conv_state_indices = conv_state_indices_.value();
-        TORCH_CHECK(conv_state_indices.scalar_type() == torch::kInt32)
-        TORCH_CHECK(conv_state_indices.is_cuda());
-        TORCH_CHECK(conv_state_indices.stride(0) == 1)
+        STD_TORCH_CHECK_NO_MSG_TEXT(
+            conv_state_indices.scalar_type() == ScalarType::Int,
+            "conv_state_indices.scalar_type() == torch::kInt32")
+        STD_TORCH_CHECK_NO_MSG(conv_state_indices.is_cuda());
+        STD_TORCH_CHECK_NO_MSG(conv_state_indices.stride(0) == 1)
         CHECK_SHAPE(conv_state_indices, batch_size);
 
         int conv_state_entries = conv_state.size(0);
         CHECK_SHAPE(conv_state, conv_state_entries, dim, conv_state_len);
 
-        params.conv_state_indices_ptr = conv_state_indices.data_ptr<int32_t>();
+        params.conv_state_indices_ptr = const_cast<int32_t*>(conv_state_indices.const_data_ptr<int32_t>());
     } else {
         CHECK_SHAPE(conv_state, batch_size, dim, conv_state_len);
         params.conv_state_indices_ptr = nullptr;
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x.get_device()};
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    torch::stable::accelerator::DeviceGuard device_guard(x.get_device_index());
+    auto stream = sgl_kernel::stable::get_current_cuda_stream(x.get_device_index());
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_update", [&] {
             causal_conv1d_update_cuda<input_t, weight_t>(params, stream);
     });
@@ -509,18 +558,18 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
 
         if (kSmemSize >= 48 * 1024) {
             #ifndef USE_ROCM
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
+            STD_CUDA_CHECK(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             #else
             // There is a slight signature discrepancy in HIP and CUDA "FuncSetAttribute" function.
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
+            STD_CUDA_CHECK(cudaFuncSetAttribute(
                 (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
             #endif
         }
         kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
 
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        STD_CUDA_KERNEL_LAUNCH_CHECK();
     });
 }
 
@@ -537,8 +586,8 @@ void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream) {
 
 
 template void causal_conv1d_fwd_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_fwd_cuda<Half, Half>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_fwd_cuda<BFloat16, BFloat16>(ConvParamsBase &params, cudaStream_t stream);
 
 
 
@@ -650,7 +699,7 @@ void causal_conv1d_update_launch(ConvParamsBase &params, cudaStream_t stream) {
         ? &causal_conv1d_update_kernel<Ktraits, false>
         : &causal_conv1d_update_kernel<Ktraits, true>;
     kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    STD_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<typename input_t, typename weight_t>
@@ -665,5 +714,11 @@ void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream) {
 }
 
 template void causal_conv1d_update_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_update_cuda<Half, Half>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_update_cuda<BFloat16, BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+
+#undef BOOL_SWITCH
+#undef CHECK_SHAPE
+#undef DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16
+#undef STD_TORCH_CHECK_NO_MSG_TEXT
+#undef STD_TORCH_CHECK_NO_MSG

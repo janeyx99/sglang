@@ -5,8 +5,12 @@
 // adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.h
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <initializer_list>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ConvParamsBase {

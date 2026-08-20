@@ -12,13 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
 
-#include "sgl_kernel_ops.h"
+#include "mamba/causal_conv1d_ops.h"
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // Compatibility API: SGLang dispatches to the JIT implementation, but external
   // sgl_kernel consumers still rely on these exported CUDA ops.
   m.def(
@@ -30,8 +28,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? cache_seqlens_,"
       "Tensor? conv_state_indices,"
       "int pad_slot_id) -> ()");
-  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
-
   m.def(
       "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
       "Tensor? bias_,"
@@ -41,5 +37,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? has_initial_state,"
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
-  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+}
+
+STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+  m.impl("causal_conv1d_update", TORCH_BOX(&causal_conv1d_update));
+  m.impl("causal_conv1d_fwd", TORCH_BOX(&causal_conv1d_fwd));
 }
