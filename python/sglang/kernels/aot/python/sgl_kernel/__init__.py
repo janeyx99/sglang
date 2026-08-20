@@ -16,7 +16,7 @@ else:
     )
 
     # Initialize the ops library based on current GPU
-    common_ops = _load_architecture_specific_ops()
+    _load_architecture_specific_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:

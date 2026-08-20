@@ -1,6 +1,5 @@
 import ctypes
 import glob
-import importlib.util
 import logging
 import os
 import shutil
@@ -85,20 +84,11 @@ def _load_architecture_specific_ops():
         ops_path = Path(matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
         try:
-            # Load the module from specific path using importlib
-            spec = importlib.util.spec_from_file_location("common_ops", str(ops_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {ops_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {ops_path}")
-
-            logger.debug(f"[sgl_kernel] Loading module from {ops_path}...")
-            spec.loader.exec_module(common_ops)
+            logger.debug(f"[sgl_kernel] Loading ops library from {ops_path}...")
+            torch.ops.load_library(str(ops_path))
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
-            return common_ops
+            logger.debug(f"[sgl_kernel] ✓ Library file: {ops_path}")
+            return
 
         except Exception as e:
             previous_import_errors.append(e)
@@ -123,19 +113,11 @@ def _load_architecture_specific_ops():
         alt_path = Path(alt_matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found fallback library: {alt_path}")
         try:
-            spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {alt_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {alt_path}")
-
-            logger.debug(f"[sgl_kernel] Loading fallback module from {alt_path}...")
-            spec.loader.exec_module(common_ops)
-            logger.debug(f"[sgl_kernel] ✓ Successfully loaded fallback library")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
-            return common_ops
+            logger.debug(f"[sgl_kernel] Loading fallback library from {alt_path}...")
+            torch.ops.load_library(str(alt_path))
+            logger.debug("[sgl_kernel] ✓ Successfully loaded fallback library")
+            logger.debug(f"[sgl_kernel] ✓ Library file: {alt_path}")
+            return
 
         except Exception as e:
             previous_import_errors.append(e)
@@ -146,20 +128,6 @@ def _load_architecture_specific_ops():
         logger.debug(
             f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
         )
-
-    # Final attempt: try standard Python import (for backward compatibility)
-    logger.debug(
-        f"[sgl_kernel] Final attempt: trying standard Python import 'common_ops'"
-    )
-    try:
-        import common_ops
-
-        logger.debug(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
-        logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
-        return common_ops
-    except ImportError as e:
-        previous_import_errors.append(e)
-        logger.debug(f"[sgl_kernel] ✗ Standard Python import failed: {e}")
 
     attempt_error_msg = "\n".join(
         f"- {type(err).__name__}: {err}" for err in previous_import_errors
@@ -180,7 +148,6 @@ def _load_architecture_specific_ops():
 Attempted locations:
 1. Architecture-specific pattern: {ops_pattern} - found files: {matching_files}
 2. Fallback pattern: {alt_pattern} - found files: {alt_matching_files}
-3. Standard Python import: common_ops - failed
 
 GPU Info:
 - Compute capability: {compute_capability}
