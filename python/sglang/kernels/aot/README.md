@@ -49,8 +49,8 @@ make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ### Steps to add a new kernel:
 
 1. Implement the kernel in [csrc](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot/csrc)
-2. Expose the interface in [include/sgl_kernel_ops.h](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/aot/include/sgl_kernel_ops.h)
-3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/aot/csrc/common_extension.cc)
+2. Expose the interface in a module-local header under [csrc](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot/csrc)
+3. Register its schema and implementation in [csrc/registration](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot/csrc/registration)
 4. Update [CMakeLists.txt](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/aot/CMakeLists.txt) to include new CUDA source
 5. Expose Python interface in [python](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/aot/python/sgl_kernel)
 6. Add test and benchmark

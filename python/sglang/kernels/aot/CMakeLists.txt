@@ -251,11 +251,6 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
-# Common extension module initialization
-set(COMMON_EXTENSION_SOURCES
-    "csrc/common_extension.cc"
-)
-
 # Source families are kept independent so each family can migrate separately.
 # NOTE: Please sort the filenames alphabetically within each family.
 set(ALLREDUCE_SOURCES
@@ -368,7 +363,6 @@ set(SPARSE_ATTENTION_SOURCES
 )
 
 set(SOURCES
-    ${COMMON_EXTENSION_SOURCES}
     ${FLASHINFER_SOURCES}
     ${SPARSE_ATTENTION_SOURCES}
 )
