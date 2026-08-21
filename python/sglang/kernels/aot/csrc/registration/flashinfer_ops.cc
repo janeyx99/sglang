@@ -12,25 +12,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include "flashinfer/flashinfer_ops.h"
 
-#include "sgl_kernel_ops.h"
+#include <torch/csrc/stable/library.h>
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
-
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
-
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
-
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
-  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
-
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
-  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
+}
+
+STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+  m.impl("rmsnorm", TORCH_BOX(&rmsnorm));
+  m.impl("gemma_rmsnorm", TORCH_BOX(&gemma_rmsnorm));
+  m.impl("gemma_fused_add_rmsnorm", TORCH_BOX(&gemma_fused_add_rmsnorm));
+  m.impl("top_k_renorm_probs", TORCH_BOX(&top_k_renorm_probs));
+  m.impl("top_p_renorm_probs", TORCH_BOX(&top_p_renorm_probs));
 }

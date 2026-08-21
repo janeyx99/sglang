@@ -348,9 +348,9 @@ set(SPECULATIVE_SOURCES
 )
 
 set(FLASHINFER_SOURCES
+    "csrc/flashinfer/norm.cu"
+    "csrc/flashinfer/renorm.cu"
     "csrc/registration/flashinfer_ops.cc"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
 )
 
 set(SPARSE_ATTENTION_SOURCES
@@ -363,7 +363,6 @@ set(SPARSE_ATTENTION_SOURCES
 )
 
 set(SOURCES
-    ${FLASHINFER_SOURCES}
     ${SPARSE_ATTENTION_SOURCES}
 )
 
@@ -372,6 +371,7 @@ set(STABLE_SOURCES
     ${ATTENTION_SOURCES}
     ${ELEMENTWISE_SOURCES}
     ${EXPERT_SPECIALIZATION_SOURCES}
+    ${FLASHINFER_SOURCES}
     ${GEMM_SOURCES}
     ${GRAMMAR_SOURCES}
     ${INFLLM_V2_SOURCES}
