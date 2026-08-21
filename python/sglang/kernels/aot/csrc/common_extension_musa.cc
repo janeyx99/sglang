@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/library.h>
 
 #include "gemm/gemm_ops.h"
+#include "moe/moe_ops.h"
 #include "sgl_kernel_ops.h"
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 

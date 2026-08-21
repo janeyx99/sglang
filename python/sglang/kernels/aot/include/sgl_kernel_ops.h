@@ -199,79 +199,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& positions);
 
 /*
- * From csrc/moe
- */
-void moe_align_block_size(
-    torch::Tensor topk_ids,
-    int64_t num_experts,
-    int64_t block_size,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor experts_ids,
-    torch::Tensor num_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    bool pad_sorted_token_ids,
-    bool ignore_invalid_expert);
-
-void topk_softmax(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& gating_output,
-    bool renormalize,
-    double moe_softcapping,
-    const c10::optional<torch::Tensor>& correction_bias);
-
-void topk_sigmoid(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& gating_output,
-    bool renormalize,
-    const c10::optional<torch::Tensor>& correction_bias);
-
-void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
-
-void moe_sum(torch::Tensor& input, torch::Tensor& output);
-
-void fp8_blockwise_scaled_grouped_mm(
-    torch::Tensor& output,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace);
-
-void prepare_moe_input(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    const std::optional<torch::Tensor>& blockscale_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
-    const int64_t num_experts,
-    const int64_t n,
-    const int64_t k);
-
-void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
-
-void apply_shuffle_mul_sum(
-    const torch::Tensor& input,
-    torch::Tensor& output,
-    const torch::Tensor& permutation,
-    const std::optional<torch::Tensor>& factors);
-
-/*
  * From csrc/elementwise (DeepSeek-V4 norm + rope)
  */
 void dsv4_fused_q_norm_rope(
@@ -300,52 +227,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 
-void fused_qk_norm_rope(
-    torch::Tensor& qkv,
-    int64_t num_heads_q,
-    int64_t num_heads_k,
-    int64_t num_heads_v,
-    int64_t head_dim,
-    double eps,
-    torch::Tensor& q_weight,
-    torch::Tensor& k_weight,
-    double base,
-    bool is_neox,
-    torch::Tensor& position_ids,
-    double factor,
-    double low,
-    double high,
-    double attention_factor,
-    int64_t rotary_dim);
-
-/*
- * From csrc/moe/cutlass_moe/w4a8
- */
-void get_cutlass_w4a8_moe_mm_data(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
-    const int64_t num_experts,
-    const int64_t n,
-    const int64_t k);
-
-void cutlass_w4a8_moe_mm(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
-    int64_t chunk_size,
-    int64_t topk);
 /*
  * From csrc/speculative
  */

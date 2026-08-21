@@ -13,6 +13,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Dispatch.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include <algorithm>
+
+#include "moe/moe_ops.h"
+#undef SGL_CONST_DATA_PTR
+#undef SGL_MUTABLE_DATA_PTR
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define WARP_SIZE 32
+#define SGL_DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...)                                                        \
+  THO_DISPATCH_SWITCH(                                                                                      \
+      TYPE,                                                                                                 \
+      NAME,                                                                                                 \
+      THO_DISPATCH_CASE(ScalarType::Byte, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::Char, __VA_ARGS__)     \
+          THO_DISPATCH_CASE(ScalarType::Short, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::Int, __VA_ARGS__) \
+              THO_DISPATCH_CASE(ScalarType::Long, __VA_ARGS__))
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.mutable_data_ptr<type>()
+#define SGL_READ_DATA_PTR(tensor, type) tensor.const_data_ptr<type>()
+
+inline uint32_t next_pow2(uint32_t x) noexcept {
+  if (x <= 1) return 1;
+  return 1u << (32 - __builtin_clz(x - 1));
+}
+#else
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,6 +54,14 @@ limitations under the License.
 #include <THC/THCAtomics.cuh>
 
 #include "utils.h"
+
+using Tensor = torch::Tensor;
+
+#define SGL_DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) DISPATCH_INTEGRAL_TYPES(TYPE, NAME, __VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define SGL_READ_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#endif
 
 #define VEC_SIZE 4
 using Vec = int4;
@@ -322,23 +364,23 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 }
 
 void moe_align_block_size(
-    torch::Tensor topk_ids,
+    Tensor topk_ids,
     int64_t num_experts,
     int64_t block_size,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor experts_ids,
-    torch::Tensor num_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
+    Tensor sorted_token_ids,
+    Tensor experts_ids,
+    Tensor num_tokens_post_pad,
+    Tensor cumsum_buffer,
     bool pad_sorted_token_ids,
     bool ignore_invalid_expert) {
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
 
   int threads = 1024;
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   int64_t max_num_tokens_padded = sorted_token_ids.size(0);
 
-  DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+  SGL_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
 
     if (small_batch_expert_mode) {
@@ -348,10 +390,10 @@ void moe_align_block_size(
 
       auto small_batch_expert_kernel = moe_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
       small_batch_expert_kernel<<<1, fill_threads + threads, shared_mem_size, stream>>>(
-          topk_ids.data_ptr<scalar_t>(),
-          sorted_token_ids.data_ptr<int32_t>(),
-          experts_ids.data_ptr<int32_t>(),
-          num_tokens_post_pad.data_ptr<int32_t>(),
+          SGL_READ_DATA_PTR(topk_ids, scalar_t),
+          SGL_MUTABLE_DATA_PTR(sorted_token_ids, int32_t),
+          SGL_MUTABLE_DATA_PTR(experts_ids, int32_t),
+          SGL_MUTABLE_DATA_PTR(num_tokens_post_pad, int32_t),
           num_experts,
           block_size,
           topk_ids.numel(),
@@ -364,14 +406,14 @@ void moe_align_block_size(
       const size_t scan_size = next_pow2(num_experts);
       const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
       align_kernel<<<2, threads, shared_mem_size, stream>>>(
-          topk_ids.data_ptr<scalar_t>(),
-          sorted_token_ids.data_ptr<int32_t>(),
-          experts_ids.data_ptr<int32_t>(),
-          num_tokens_post_pad.data_ptr<int32_t>(),
+          SGL_READ_DATA_PTR(topk_ids, scalar_t),
+          SGL_MUTABLE_DATA_PTR(sorted_token_ids, int32_t),
+          SGL_MUTABLE_DATA_PTR(experts_ids, int32_t),
+          SGL_MUTABLE_DATA_PTR(num_tokens_post_pad, int32_t),
           num_experts,
           block_size,
           topk_ids.numel(),
-          cumsum_buffer.data_ptr<int32_t>(),
+          SGL_MUTABLE_DATA_PTR(cumsum_buffer, int32_t),
           pad_sorted_token_ids,
           ignore_invalid_expert,
           scan_size,
@@ -384,11 +426,20 @@ void moe_align_block_size(
 
       auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
       sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-          topk_ids.data_ptr<scalar_t>(),
-          sorted_token_ids.data_ptr<int32_t>(),
-          cumsum_buffer.data_ptr<int32_t>(),
+          SGL_READ_DATA_PTR(topk_ids, scalar_t),
+          SGL_MUTABLE_DATA_PTR(sorted_token_ids, int32_t),
+          SGL_MUTABLE_DATA_PTR(cumsum_buffer, int32_t),
           topk_ids.numel(),
           ignore_invalid_expert);
     }
   });
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef CEILDIV
+#undef WARP_SIZE
+#endif
+#undef SGL_DISPATCH_INTEGRAL_TYPES
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_MUTABLE_DATA_PTR
+#undef SGL_READ_DATA_PTR

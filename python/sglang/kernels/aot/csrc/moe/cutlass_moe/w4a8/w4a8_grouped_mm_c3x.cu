@@ -1,6 +1,4 @@
-#include <c10/cuda/CUDAGuard.h>
 #include <cudaTypedefs.h>
-#include <torch/all.h>
 
 #include <type_traits>
 
@@ -38,17 +36,17 @@ using SM90_CO = SM90W4A8Config<M, N, K, A, B, C, Sched::CO>;
 
 template <typename Config>
 inline void invoke_gemm(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    SglTensor const& a_tensors,
+    SglTensor const& b_tensors,
+    SglTensor const& a_scales,
+    SglTensor const& b_scales,
+    SglTensor const& expert_offsets,
+    SglTensor const& problem_sizes,
+    SglTensor const& a_strides,
+    SglTensor const& b_strides,
+    SglTensor const& d_strides,
+    SglTensor const& s_strides,
     int64_t chunk_size) {
   using GemmT = typename Config::Cutlass3xW4A8Gemm;
   cutlass_w4a8_group_gemm_caller<GemmT>(
@@ -86,17 +84,17 @@ inline void invoke_gemm(
 #define INVOKE_GEMM_WITH_CONFIG(Config) INVOKE_GEMM_WITH_CONFIG_HELPER Config
 
 void dispatch_w4a8_moe_mm_sm90(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    SglTensor const& a_tensors,
+    SglTensor const& b_tensors,
+    SglTensor const& a_scales,
+    SglTensor const& b_scales,
+    SglTensor const& expert_offsets,
+    SglTensor const& problem_sizes,
+    SglTensor const& a_strides,
+    SglTensor const& b_strides,
+    SglTensor const& d_strides,
+    SglTensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
   uint32_t const m = a_tensors.size(0) / topk;
@@ -184,17 +182,17 @@ void dispatch_w4a8_moe_mm_sm90(
 }  // namespace
 
 void cutlass_w4a8_moe_mm_sm90(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    SglTensor const& a_tensors,
+    SglTensor const& b_tensors,
+    SglTensor const& a_scales,
+    SglTensor const& b_scales,
+    SglTensor const& expert_offsets,
+    SglTensor const& problem_sizes,
+    SglTensor const& a_strides,
+    SglTensor const& b_strides,
+    SglTensor const& d_strides,
+    SglTensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
   dispatch_w4a8_moe_mm_sm90(

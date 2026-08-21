@@ -1,9 +1,10 @@
-#include <c10/cuda/CUDAGuard.h>
 #include <cudaTypedefs.h>
-#include <torch/all.h>
 
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+
+#include "moe/moe_ops.h"
+#include "sgl_kernel_cuda_stream.h"
 
 template <int BLOCK_SIZE>
 __global__ void compute_problem_sizes_w4a8(
@@ -117,31 +118,30 @@ void compute_expert_offsets_w4a8(
 }
 
 void get_cutlass_w4a8_moe_mm_data_caller(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
+    const SglTensor& topk_ids,
+    SglTensor& expert_offsets,
+    SglTensor& problem_sizes1,
+    SglTensor& problem_sizes2,
+    SglTensor& input_permutation,
+    SglTensor& output_permutation,
     const int64_t num_experts,
     const int64_t n,
     const int64_t k) {
-  auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
-  auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(topk_ids.get_device_index());
 
   constexpr uint64_t BLOCK_SIZE = 512;
   compute_problem_sizes_w4a8<BLOCK_SIZE><<<num_experts, BLOCK_SIZE, 0, stream>>>(
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(problem_sizes1.data_ptr()),
-      static_cast<int32_t*>(problem_sizes2.data_ptr()),
+      static_cast<const int32_t*>(topk_ids.const_data_ptr()),
+      static_cast<int32_t*>(problem_sizes1.mutable_data_ptr()),
+      static_cast<int32_t*>(problem_sizes2.mutable_data_ptr()),
       topk_ids.numel(),
       n,
       k);
 
   compute_expert_offsets_w4a8(
       stream,
-      static_cast<const int32_t*>(problem_sizes1.data_ptr()),
-      static_cast<int32_t*>(expert_offsets.data_ptr()),
+      static_cast<const int32_t*>(problem_sizes1.const_data_ptr()),
+      static_cast<int32_t*>(expert_offsets.mutable_data_ptr()),
       num_experts,
       3,
       1);

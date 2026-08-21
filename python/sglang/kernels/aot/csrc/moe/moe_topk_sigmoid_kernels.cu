@@ -16,9 +16,58 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+
+#include <optional>
+
+#include "moe/moe_ops.h"
+#include "moe/moe_stable_utils.h"
+#undef SGL_CONST_DATA_PTR
+#undef SGL_MUTABLE_DATA_PTR
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+using DeviceGuard = torch::stable::accelerator::DeviceGuard;
+using HalfType = torch::headeronly::Half;
+using BFloat16Type = torch::headeronly::BFloat16;
+
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_OPTIONAL_TENSOR_ARG const std::optional<Tensor>& correction_bias
+#define SGL_CONST_DATA_PTR(tensor, type) tensor.const_data_ptr<type>()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.mutable_data_ptr<type>()
+#define WARP_SIZE 32
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
+
+#include "utils.h"
+
+using Tensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+using HalfType = at::Half;
+using BFloat16Type = at::BFloat16;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_OPTIONAL_TENSOR_ARG const c10::optional<Tensor>& correction_bias
+#define SGL_CONST_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#endif
+
+#include <type_traits>
 
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
@@ -28,8 +77,6 @@ limitations under the License.
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 #endif
-
-#include "utils.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -472,7 +519,7 @@ void topkGatingSigmoidKernelLauncher(
       LAUNCH_SIGMOID(T, 256, WARPS_PER_TB);
       break;
     default: {
-      TORCH_CHECK(
+      SGL_CHECK(
           sigmoid_workspace != nullptr,
           "sigmoid_workspace must be provided for num_experts that are not a power of 2.");
       static constexpr int TPB = 256;
@@ -494,33 +541,33 @@ void topkGatingSigmoidKernelLauncher(
 }
 
 void topk_sigmoid(
-    torch::Tensor& topk_weights,   // [num_tokens, topk]
-    torch::Tensor& topk_indices,   // [num_tokens, topk]
-    torch::Tensor& gating_output,  // [num_tokens, num_experts]
+    Tensor& topk_weights,   // [num_tokens, topk]
+    Tensor& topk_indices,   // [num_tokens, topk]
+    Tensor& gating_output,  // [num_tokens, num_experts]
     const bool renormalize,
-    const c10::optional<torch::Tensor>& correction_bias) {
+    SGL_OPTIONAL_TENSOR_ARG) {
   // Check data type
-  TORCH_CHECK(
-      gating_output.scalar_type() == at::ScalarType::Float || gating_output.scalar_type() == at::ScalarType::Half ||
-          gating_output.scalar_type() == at::ScalarType::BFloat16,
+  SGL_CHECK(
+      gating_output.scalar_type() == ScalarType::Float || gating_output.scalar_type() == ScalarType::Half ||
+          gating_output.scalar_type() == ScalarType::BFloat16,
       "gating_output must be float32, float16, or bfloat16");
 
   // Check dimensions
-  TORCH_CHECK(gating_output.dim() == 2, "gating_output must be 2D tensor [num_tokens, num_experts]");
-  TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D tensor [num_tokens, topk]");
-  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D tensor [num_tokens, topk]");
+  SGL_CHECK(gating_output.dim() == 2, "gating_output must be 2D tensor [num_tokens, num_experts]");
+  SGL_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D tensor [num_tokens, topk]");
+  SGL_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D tensor [num_tokens, topk]");
 
   // Check shapes
-  TORCH_CHECK(
+  SGL_CHECK(
       gating_output.size(0) == topk_weights.size(0),
       "First dimension of topk_weights must match num_tokens in gating_output");
-  TORCH_CHECK(
+  SGL_CHECK(
       gating_output.size(0) == topk_indices.size(0),
       "First dimension of topk_indices must match num_tokens in gating_output");
-  TORCH_CHECK(
+  SGL_CHECK(
       topk_weights.size(-1) == topk_indices.size(-1),
       "Second dimension of topk_indices must match topk in topk_weights");
-  TORCH_CHECK(topk_weights.size(-1) <= gating_output.size(-1), "topk must be less than or equal to num_experts");
+  SGL_CHECK(topk_weights.size(-1) <= gating_output.size(-1), "topk must be less than or equal to num_experts");
 
   const int num_experts = static_cast<int>(gating_output.size(-1));
   const int num_tokens = static_cast<int>(gating_output.size(0));
@@ -530,56 +577,67 @@ void topk_sigmoid(
   const bool needs_workspace = !is_pow_2 || num_experts > 256;
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
+#ifdef TORCH_TARGET_VERSION
+  SGL_CHECK(gating_output.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  const DeviceGuard device_guard(gating_output.get_device_index());
+  const cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
+  Tensor sigmoid_workspace =
+      sgl_kernel::moe::stable::empty_contiguous_like(gating_output, workspace_size, ScalarType::Float);
+#else
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  torch::Tensor sigmoid_workspace =
-      torch::empty({workspace_size}, gating_output.options().dtype(at::ScalarType::Float));
+  const cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
+  Tensor sigmoid_workspace = torch::empty({workspace_size}, gating_output.options().dtype(ScalarType::Float));
+#endif
 
-  const at::ScalarType dtype = gating_output.scalar_type();
+  const ScalarType dtype = gating_output.scalar_type();
 
   // Validate correction_bias if provided - must always be float32
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {
-    const torch::Tensor& bias_tensor = correction_bias.value();
-    TORCH_CHECK(bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
-    TORCH_CHECK(bias_tensor.size(0) == num_experts, "correction_bias size must match num_experts");
-    TORCH_CHECK(
-        bias_tensor.scalar_type() == at::ScalarType::Float,
+    const Tensor& bias_tensor = correction_bias.value();
+    SGL_CHECK(bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
+    SGL_CHECK(bias_tensor.size(0) == num_experts, "correction_bias size must match num_experts");
+    SGL_CHECK(
+        bias_tensor.scalar_type() == ScalarType::Float,
         "correction_bias must be float32, got ",
+#ifdef TORCH_TARGET_VERSION
+        torch::headeronly::toString(bias_tensor.scalar_type()));
+#else
         bias_tensor.scalar_type());
-    bias_ptr = bias_tensor.data_ptr<float>();
+#endif
+    bias_ptr = SGL_CONST_DATA_PTR(bias_tensor, float);
   }
 
-  if (dtype == at::ScalarType::Float) {
+  if (dtype == ScalarType::Float) {
     topkGatingSigmoidKernelLauncher<float>(
-        gating_output.data_ptr<float>(),
-        topk_weights.data_ptr<float>(),
-        topk_indices.data_ptr<int>(),
-        sigmoid_workspace.data_ptr<float>(),
+        SGL_CONST_DATA_PTR(gating_output, float),
+        SGL_MUTABLE_DATA_PTR(topk_weights, float),
+        SGL_MUTABLE_DATA_PTR(topk_indices, int),
+        SGL_MUTABLE_DATA_PTR(sigmoid_workspace, float),
         num_tokens,
         num_experts,
         topk,
         renormalize,
         bias_ptr,
         stream);
-  } else if (dtype == at::ScalarType::Half) {
+  } else if (dtype == ScalarType::Half) {
     topkGatingSigmoidKernelLauncher<__half>(
-        reinterpret_cast<const __half*>(gating_output.data_ptr<at::Half>()),
-        topk_weights.data_ptr<float>(),
-        topk_indices.data_ptr<int>(),
-        sigmoid_workspace.data_ptr<float>(),
+        reinterpret_cast<const __half*>(SGL_CONST_DATA_PTR(gating_output, HalfType)),
+        SGL_MUTABLE_DATA_PTR(topk_weights, float),
+        SGL_MUTABLE_DATA_PTR(topk_indices, int),
+        SGL_MUTABLE_DATA_PTR(sigmoid_workspace, float),
         num_tokens,
         num_experts,
         topk,
         renormalize,
         bias_ptr,
         stream);
-  } else if (dtype == at::ScalarType::BFloat16) {
+  } else if (dtype == ScalarType::BFloat16) {
     topkGatingSigmoidKernelLauncher<__nv_bfloat16>(
-        reinterpret_cast<const __nv_bfloat16*>(gating_output.data_ptr<at::BFloat16>()),
-        topk_weights.data_ptr<float>(),
-        topk_indices.data_ptr<int>(),
-        sigmoid_workspace.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(SGL_CONST_DATA_PTR(gating_output, BFloat16Type)),
+        SGL_MUTABLE_DATA_PTR(topk_weights, float),
+        SGL_MUTABLE_DATA_PTR(topk_indices, int),
+        SGL_MUTABLE_DATA_PTR(sigmoid_workspace, float),
         num_tokens,
         num_experts,
         topk,
@@ -587,6 +645,20 @@ void topk_sigmoid(
         bias_ptr,
         stream);
   } else {
-    TORCH_CHECK(false, "Unsupported gating_output dtype: ", dtype);
+#ifdef TORCH_TARGET_VERSION
+    SGL_CHECK(false, "Unsupported gating_output dtype: ", torch::headeronly::toString(dtype));
+#else
+    SGL_CHECK(false, "Unsupported gating_output dtype: ", dtype);
+#endif
   }
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef WARP_SIZE
+#undef SGLANG_SHFL_XOR_SYNC_WIDTH
+#endif
+#undef SGL_CHECK
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_OPTIONAL_TENSOR_ARG
+#undef SGL_CONST_DATA_PTR
+#undef SGL_MUTABLE_DATA_PTR

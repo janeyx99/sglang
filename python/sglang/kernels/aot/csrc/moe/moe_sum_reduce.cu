@@ -1,19 +1,87 @@
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Dispatch.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+
+#include "moe/moe_ops.h"
+#undef SGL_CONST_DATA_PTR
+#undef SGL_MUTABLE_DATA_PTR
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+using HalfType = torch::headeronly::Half;
+using BFloat16Type = torch::headeronly::BFloat16;
+
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_CONST_DATA_PTR(tensor, type) tensor.const_data_ptr<type>()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.mutable_data_ptr<type>()
+#define SGL_DISPATCH_FLOATING_TYPES_AND2(TYPE, NAME, ...)                                                  \
+  THO_DISPATCH_SWITCH(                                                                                     \
+      TYPE,                                                                                                \
+      NAME,                                                                                                \
+      THO_DISPATCH_CASE(ScalarType::Double, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::Float, __VA_ARGS__) \
+          THO_DISPATCH_CASE(ScalarType::Half, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::BFloat16, __VA_ARGS__))
+#else
 #include <ATen/OpMathType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
+
+#include "utils.h"
+
+using Tensor = at::Tensor;
+using ScalarType = at::ScalarType;
+using HalfType = at::Half;
+using BFloat16Type = at::BFloat16;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_CONST_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define SGL_MUTABLE_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define SGL_DISPATCH_FLOATING_TYPES_AND2(TYPE, NAME, ...) \
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, TYPE, NAME, __VA_ARGS__)
+#endif
+
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
-#include <torch/all.h>
 
 #include <iostream>
 #include <type_traits>
 
 #include "cutlass/array.h"
-#include "utils.h"
 
+#ifdef TORCH_TARGET_VERSION
+template <typename T>
+struct stable_opmath_type {
+  using type = T;
+};
+
+template <>
+struct stable_opmath_type<HalfType> {
+  using type = float;
+};
+
+template <>
+struct stable_opmath_type<BFloat16Type> {
+  using type = float;
+};
+#endif
+
+#ifdef TORCH_TARGET_VERSION
+template <typename T>
+using opmath_t = typename stable_opmath_type<T>::type;
+#else
 template <typename T>
 using opmath_t = at::opmath_type<T>;
+#endif
 
 template <typename T>
 __device__ __forceinline__ opmath_t<T> to_acc(T x) {
@@ -26,20 +94,20 @@ __device__ __forceinline__ T from_acc(opmath_t<T> x) {
 }
 
 template <>
-__device__ __forceinline__ opmath_t<at::Half> to_acc<at::Half>(at::Half x) {
+__device__ __forceinline__ opmath_t<HalfType> to_acc<HalfType>(HalfType x) {
   return __half2float(__nv_half(x));
 }
 template <>
-__device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
+__device__ __forceinline__ HalfType from_acc<HalfType>(opmath_t<HalfType> x) {
   return __float2half_rn(x);
 }
 
 template <>
-__device__ __forceinline__ opmath_t<at::BFloat16> to_acc<at::BFloat16>(at::BFloat16 x) {
+__device__ __forceinline__ opmath_t<BFloat16Type> to_acc<BFloat16Type>(BFloat16Type x) {
   return __bfloat162float(__nv_bfloat16(x));
 }
 template <>
-__device__ __forceinline__ at::BFloat16 from_acc<at::BFloat16>(opmath_t<at::BFloat16> x) {
+__device__ __forceinline__ BFloat16Type from_acc<BFloat16Type>(opmath_t<BFloat16Type> x) {
   return __float2bfloat16_rn(x);
 }
 
@@ -55,8 +123,8 @@ union Pack16B {
 
 template <int WARPS_PER_BLOCK>
 __global__ void moe_sum_reduce_warp_per_token_vec_kernel(
-    const at::BFloat16* __restrict__ x,
-    at::BFloat16* __restrict__ y,
+    const BFloat16Type* __restrict__ x,
+    BFloat16Type* __restrict__ y,
     const int64_t token_num,
     const int64_t hidden_dim,
     const int64_t topk_num,
@@ -224,16 +292,16 @@ __global__ void moe_sum_reduce_kernel_warp_token_general(
   }
 }
 
-void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor) {
-  TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
-  TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
-  TORCH_CHECK(input.dim() == 3, "input must be a 3D tensor like [token_num, topk_num, hidden_dim]");
-  TORCH_CHECK(output.dim() == 2, "output must be [token_num, hidden_dim]");
-  TORCH_CHECK(input.size(0) == output.size(0), "token dim mismatch");
-  TORCH_CHECK(input.size(2) == output.size(1), "hidden_dim mismatch");
+void moe_sum_reduce(Tensor& input, Tensor& output, double routed_scaling_factor) {
+  SGL_CHECK(input.is_cuda(), "input must be CUDA tensor");
+  SGL_CHECK(output.is_cuda(), "output must be CUDA tensor");
+  SGL_CHECK(input.dim() == 3, "input must be a 3D tensor like [token_num, topk_num, hidden_dim]");
+  SGL_CHECK(output.dim() == 2, "output must be [token_num, hidden_dim]");
+  SGL_CHECK(input.size(0) == output.size(0), "token dim mismatch");
+  SGL_CHECK(input.size(2) == output.size(1), "hidden_dim mismatch");
 
-  TORCH_CHECK(input.is_contiguous(), "expect input to be contiguous");
-  TORCH_CHECK(output.is_contiguous(), "expect output to be contiguous");
+  SGL_CHECK(input.is_contiguous(), "expect input to be contiguous");
+  SGL_CHECK(output.is_contiguous(), "expect output to be contiguous");
 
   const int64_t token_num = input.size(0);
   const int64_t topk_num = input.size(1);
@@ -243,9 +311,10 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
   const int64_t in_stride_topk = input.stride(1);
   const int64_t out_stride_token = output.stride(0);
 
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = SGL_CURRENT_CUDA_STREAM();
 
-  const bool fast_bf16_vec_ok = (input.scalar_type() == at::kBFloat16) && (token_num > 256) && (hidden_dim % 8 == 0);
+  const bool fast_bf16_vec_ok =
+      (input.scalar_type() == ScalarType::BFloat16) && (token_num > 256) && (hidden_dim % 8 == 0);
 
   // Fast path for bf16 vectorize
   if (fast_bf16_vec_ok) {
@@ -262,12 +331,12 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
     dim3 block(THREADS);
     dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = SGL_CURRENT_CUDA_STREAM();
 
     const float scale = static_cast<float>(routed_scaling_factor);
     moe_sum_reduce_warp_per_token_vec_kernel<WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()),
-        reinterpret_cast<at::BFloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const BFloat16Type*>(SGL_CONST_DATA_PTR(input, BFloat16Type)),
+        reinterpret_cast<BFloat16Type*>(SGL_MUTABLE_DATA_PTR(output, BFloat16Type)),
         token_num,
         hidden_dim,
         topk_num,
@@ -276,7 +345,7 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         out_stride_token,
         scale);
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (bf16 vec) launch failed");
+    SGL_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (bf16 vec) launch failed");
     return;
   }
 
@@ -294,8 +363,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 #define LAUNCH_SMALL_TOKEN_KERNEL(TOPK)                               \
   moe_sum_reduce_kernel<scalar_t_, TOPK><<<grid, block, 0, stream>>>( \
-      input.data_ptr<scalar_t_>(),                                    \
-      output.data_ptr<scalar_t_>(),                                   \
+      SGL_CONST_DATA_PTR(input, scalar_t_),                           \
+      SGL_MUTABLE_DATA_PTR(output, scalar_t_),                        \
       token_num,                                                      \
       hidden_dim,                                                     \
       in_stride_token,                                                \
@@ -303,41 +372,40 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
       out_stride_token,                                               \
       scale);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_small_token", [&] {
-          using scalar_t_ = scalar_t;
-          using acc_t_ = opmath_t<scalar_t_>;
-          const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
+    SGL_DISPATCH_FLOATING_TYPES_AND2(input.scalar_type(), "moe_sum_reduce_cuda_small_token", [&] {
+      using scalar_t_ = scalar_t;
+      using acc_t_ = opmath_t<scalar_t_>;
+      const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
 
-          switch (topk_num) {
-            case 2:
-              LAUNCH_SMALL_TOKEN_KERNEL(2);
-              break;
-            case 4:
-              LAUNCH_SMALL_TOKEN_KERNEL(4);
-              break;
-            case 8:
-              LAUNCH_SMALL_TOKEN_KERNEL(8);
-              break;
-            case 9:
-              LAUNCH_SMALL_TOKEN_KERNEL(9);
-              break;
-            default:  // launch general kernel
-              moe_sum_reduce_kernel_general<scalar_t_><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  static_cast<int>(topk_num),
-                  scale);
-          }
-        });
+      switch (topk_num) {
+        case 2:
+          LAUNCH_SMALL_TOKEN_KERNEL(2);
+          break;
+        case 4:
+          LAUNCH_SMALL_TOKEN_KERNEL(4);
+          break;
+        case 8:
+          LAUNCH_SMALL_TOKEN_KERNEL(8);
+          break;
+        case 9:
+          LAUNCH_SMALL_TOKEN_KERNEL(9);
+          break;
+        default:  // launch general kernel
+          moe_sum_reduce_kernel_general<scalar_t_><<<grid, block, 0, stream>>>(
+              SGL_CONST_DATA_PTR(input, scalar_t_),
+              SGL_MUTABLE_DATA_PTR(output, scalar_t_),
+              token_num,
+              hidden_dim,
+              in_stride_token,
+              in_stride_topk,
+              out_stride_token,
+              static_cast<int>(topk_num),
+              scale);
+      }
+    });
 #undef LAUNCH_SMALL_TOKEN_KERNEL
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (small-token) launch failed");
+    SGL_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (small-token) launch failed");
 
   } else {
     // ---------- warp-per-token ----------
@@ -355,8 +423,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 #define LAUNCH_WARP_PER_TOKEN_KERNEL(TOPK)                                                             \
   moe_sum_reduce_kernel_warp_token_topk<scalar_t_, TOPK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>( \
-      input.data_ptr<scalar_t_>(),                                                                     \
-      output.data_ptr<scalar_t_>(),                                                                    \
+      SGL_CONST_DATA_PTR(input, scalar_t_),                                                            \
+      SGL_MUTABLE_DATA_PTR(output, scalar_t_),                                                         \
       token_num,                                                                                       \
       hidden_dim,                                                                                      \
       in_stride_token,                                                                                 \
@@ -364,40 +432,45 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
       out_stride_token,                                                                                \
       scale);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_large_token", [&] {
-          using scalar_t_ = scalar_t;
-          using acc_t_ = opmath_t<scalar_t_>;
-          const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
+    SGL_DISPATCH_FLOATING_TYPES_AND2(input.scalar_type(), "moe_sum_reduce_cuda_large_token", [&] {
+      using scalar_t_ = scalar_t;
+      using acc_t_ = opmath_t<scalar_t_>;
+      const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
 
-          switch (topk_num) {
-            case 2:
-              LAUNCH_WARP_PER_TOKEN_KERNEL(2);
-              break;
-            case 4:
-              LAUNCH_WARP_PER_TOKEN_KERNEL(4);
-              break;
-            case 8:
-              LAUNCH_WARP_PER_TOKEN_KERNEL(8);
-              break;
-            case 9:
-              LAUNCH_WARP_PER_TOKEN_KERNEL(9);
-              break;
-            default:  // launch general kernel
-              moe_sum_reduce_kernel_warp_token_general<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  static_cast<int>(topk_num),
-                  scale);
-          }
-        });
+      switch (topk_num) {
+        case 2:
+          LAUNCH_WARP_PER_TOKEN_KERNEL(2);
+          break;
+        case 4:
+          LAUNCH_WARP_PER_TOKEN_KERNEL(4);
+          break;
+        case 8:
+          LAUNCH_WARP_PER_TOKEN_KERNEL(8);
+          break;
+        case 9:
+          LAUNCH_WARP_PER_TOKEN_KERNEL(9);
+          break;
+        default:  // launch general kernel
+          moe_sum_reduce_kernel_warp_token_general<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+              SGL_CONST_DATA_PTR(input, scalar_t_),
+              SGL_MUTABLE_DATA_PTR(output, scalar_t_),
+              token_num,
+              hidden_dim,
+              in_stride_token,
+              in_stride_topk,
+              out_stride_token,
+              static_cast<int>(topk_num),
+              scale);
+      }
+    });
 #undef LAUNCH_WARP_PER_TOKEN_KERNEL
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (warp-token) launch failed");
+    SGL_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (warp-token) launch failed");
   }
 }
+
+#undef SGL_CHECK
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_CONST_DATA_PTR
+#undef SGL_MUTABLE_DATA_PTR
+#undef SGL_DISPATCH_FLOATING_TYPES_AND2
