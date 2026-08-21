@@ -18,6 +18,7 @@ limitations under the License.
 #include <cuda_runtime.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/c/shim.h>
 #include <torch/headeronly/util/shim_utils.h>
 
 namespace sgl_kernel::stable {
@@ -32,6 +33,13 @@ inline cudaStream_t get_current_cuda_stream(torch::stable::accelerator::DeviceIn
 // contract is tied to the process's current CUDA device.
 inline cudaStream_t get_current_cuda_stream() {
   return get_current_cuda_stream(torch::stable::accelerator::getCurrentDeviceIndex());
+}
+
+inline cudaStream_t
+get_cuda_stream_from_pool(bool high_priority, torch::stable::accelerator::DeviceIndex device_index) {
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(torch_get_cuda_stream_from_pool(high_priority, device_index, &stream_ptr));
+  return static_cast<cudaStream_t>(stream_ptr);
 }
 
 }  // namespace sgl_kernel::stable
