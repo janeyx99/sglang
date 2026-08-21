@@ -6,14 +6,40 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#ifdef TORCH_TARGET_VERSION
+struct cuda_error : public std::runtime_error {
+  cuda_error(const char* message) : std::runtime_error(message) {}
+  cuda_error(const std::string& message) : cuda_error(message.c_str()) {}
+};
+
+#define CHECK_CUDA_SUCCESS(cmd)                                         \
+  do {                                                                  \
+    cudaError_t e = cmd;                                                \
+    if (e != cudaSuccess) {                                             \
+      std::stringstream _message;                                       \
+      auto s = cudaGetErrorString(e);                                   \
+      _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
+      throw cuda_error(_message.str());                                 \
+    }                                                                   \
+  } while (0)
+#else
 #include "utils.h"
+#endif
 
 namespace sglang {
 
@@ -691,3 +717,7 @@ class CustomAllreduce {
  half *, int, int, int);
 */
 }  // namespace sglang
+
+#ifdef TORCH_TARGET_VERSION
+#undef CHECK_CUDA_SUCCESS
+#endif

@@ -1,18 +1,54 @@
 // Adapted from: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cu
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "allreduce/allreduce_ops.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/shim_utils.h>
+
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define SGL_CHECK_EQ(val1, val2) \
+  STD_TORCH_CHECK((val1) == (val2), "Check failed: " #val1 " == " #val2 " (", (val1), " vs. ", (val2), "). ")
+#define SGL_CHECK_LE(val1, val2) \
+  STD_TORCH_CHECK((val1) <= (val2), "Check failed: " #val1 " <= " #val2 " (", (val1), " vs. ", (val2), "). ")
+#define SGL_CHECK_NO_MSG(condition)                                                                   \
+  STD_TORCH_CHECK(                                                                                    \
+      condition,                                                                                      \
+      "Expected " #condition                                                                          \
+      " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+      "enhancement request to PyTorch.)")
+#else
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 
+using Tensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+
+#define SGL_CHECK_EQ TORCH_CHECK_EQ
+#define SGL_CHECK_LE TORCH_CHECK_LE
+#define SGL_CHECK_NO_MSG(condition) TORCH_CHECK(condition)
+#endif
+
 #include "custom_all_reduce.cuh"
 
-// Fake pointer type, must match fptr_t type in ops.h.
-// We use this type alias to indicate when pointers are passed in as int64_t.
-using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-fptr_t
-init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink) {
+fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, Tensor& rank_data, int64_t rank, bool full_nvlink) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
   if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported for now");
@@ -23,7 +59,7 @@ init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_dat
     ipc_ptrs[i] = reinterpret_cast<sglang::Signal*>(fake_ipc_ptrs[i]);
   }
   return (fptr_t) new sglang::CustomAllreduce(
-      ipc_ptrs, rank_data.data_ptr(), rank_data.numel(), rank, world_size, full_nvlink);
+      ipc_ptrs, SGL_MUTABLE_DATA_PTR(rank_data), rank_data.numel(), rank, world_size, full_nvlink);
 }
 
 /**
@@ -42,9 +78,18 @@ init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_dat
  * 5. A[None].expand(2, -1, -1, -1): Not OK
  * 6. A[:, 1:, 1:]: Not OK
  */
-bool _is_weak_contiguous(torch::Tensor& t) {
+bool _is_weak_contiguous(Tensor& t) {
+#ifdef TORCH_TARGET_VERSION
+  if (t.is_contiguous()) {
+    return true;
+  }
+  int64_t storage_nbytes = 0;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_storage_size(t.get(), &storage_nbytes));
+  return storage_nbytes - t.storage_offset() * t.element_size() == static_cast<int64_t>(t.numel() * t.element_size());
+#else
   return t.is_contiguous() ||
          (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
+#endif
 }
 
 /**
@@ -54,40 +99,54 @@ bool _is_weak_contiguous(torch::Tensor& t) {
  * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
  * copied into _reg_buffer.
  */
-void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+void all_reduce(fptr_t _fa, Tensor& inp, Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
+#ifdef TORCH_TARGET_VERSION
+  STD_TORCH_CHECK(inp.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  const auto device_index = inp.get_device_index();
+  const torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(device_index);
+#else
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+#endif
 
-  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-  TORCH_CHECK_EQ(inp.numel(), out.numel());
-  TORCH_CHECK(_is_weak_contiguous(out));
-  TORCH_CHECK(_is_weak_contiguous(inp));
+  SGL_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  SGL_CHECK_EQ(inp.numel(), out.numel());
+  SGL_CHECK_NO_MSG(_is_weak_contiguous(out));
+  SGL_CHECK_NO_MSG(_is_weak_contiguous(inp));
   auto input_size = inp.numel() * inp.element_size();
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
   if (reg_buffer) {
-    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    SGL_CHECK_LE(input_size, reg_buffer_sz_bytes);
+#ifdef TORCH_TARGET_VERSION
+    STD_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.const_data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+#else
     AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+#endif
   } else {
-    reg_buffer = inp.data_ptr();
+    reg_buffer = const_cast<void*>(SGL_CONST_DATA_PTR(inp));
   }
   switch (out.scalar_type()) {
-    case at::ScalarType::Float: {
+    case ScalarType::Float: {
       fa->allreduce<float>(
-          stream, reinterpret_cast<float*>(reg_buffer), reinterpret_cast<float*>(out.data_ptr()), out.numel());
+          stream,
+          reinterpret_cast<float*>(reg_buffer),
+          reinterpret_cast<float*>(SGL_MUTABLE_DATA_PTR(out)),
+          out.numel());
       break;
     }
-    case at::ScalarType::Half: {
+    case ScalarType::Half: {
       fa->allreduce<half>(
-          stream, reinterpret_cast<half*>(reg_buffer), reinterpret_cast<half*>(out.data_ptr()), out.numel());
+          stream, reinterpret_cast<half*>(reg_buffer), reinterpret_cast<half*>(SGL_MUTABLE_DATA_PTR(out)), out.numel());
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16: {
+    case ScalarType::BFloat16: {
       fa->allreduce<nv_bfloat16>(
           stream,
           reinterpret_cast<nv_bfloat16*>(reg_buffer),
-          reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(SGL_MUTABLE_DATA_PTR(out)),
           out.numel());
       break;
     }
@@ -107,7 +166,7 @@ int64_t meta_size() {
 
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
-  TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
+  SGL_CHECK_NO_MSG(fake_ipc_ptrs.size() == fa->world_size_);
   void* ipc_ptrs[8];
   for (int i = 0; i < fake_ipc_ptrs.size(); i++) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
@@ -135,3 +194,7 @@ void register_graph_buffers(
   bytes.reserve(handles.size());
   fa->register_graph_buffers(bytes, offsets);
 }
+
+#undef SGL_CHECK_NO_MSG
+#undef SGL_CHECK_LE
+#undef SGL_CHECK_EQ

@@ -12,26 +12,35 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include "allreduce/allreduce_ops.h"
 
-#include "sgl_kernel_ops.h"
+#include <torch/csrc/stable/library.h>
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
-  m.def("register_graph_buffers", &register_graph_buffers);
-  m.def("dispose", &dispose);
-  m.def("meta_size", &meta_size);
-  m.def("register_buffer", &register_buffer);
+STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("get_graph_buffer_ipc_meta(int _0) -> (int[] _0, int[] _1)");
+  m.def("register_graph_buffers(int _0, int[][] _1, int[][] _2) -> ()");
+  m.def("dispose(int _0) -> ()");
+  m.def("meta_size() -> int _0");
+  m.def("register_buffer(int _0, int[] _1) -> ()");
 
   m.def(
       "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
       "int rank, bool full_nvlink) -> int");
-  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
 
   m.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
-  m.impl("all_reduce", torch::kCUDA, &all_reduce);
+}
+
+STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CompositeImplicitAutograd, m) {
+  m.impl("get_graph_buffer_ipc_meta", TORCH_BOX(&get_graph_buffer_ipc_meta));
+  m.impl("register_graph_buffers", TORCH_BOX(&register_graph_buffers));
+  m.impl("dispose", TORCH_BOX(&dispose));
+  m.impl("meta_size", TORCH_BOX(&meta_size));
+  m.impl("register_buffer", TORCH_BOX(&register_buffer));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+  m.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
+  m.impl("all_reduce", TORCH_BOX(&all_reduce));
 }
