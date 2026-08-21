@@ -1,9 +1,27 @@
 // Adapted from
 // https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Layout.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Half.h>
+
+#include "gemm/gemm_ops.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using Layout = torch::headeronly::Layout;
+using ScalarType = torch::headeronly::ScalarType;
+#else
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
+#endif
+
 #include <cuda.h>
 #include <cuda_fp16.h>
-#include <torch/all.h>
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #include <cuda_bf16.h>
 #endif
@@ -183,6 +201,47 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 #endif
 }
 
+#ifdef TORCH_TARGET_VERSION
+Tensor awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) {
+  int qweight_rows = qweight.size(0);
+  int qweight_cols = qweight.size(1);
+  int group_size = qweight_rows / scales.size(0);
+
+  int x_num_threads = 16;
+  int y_num_threads = 16;
+  int x_blocks = (qweight_cols + x_num_threads - 1) / x_num_threads;
+  int y_blocks = (qweight_rows + y_num_threads - 1) / y_num_threads;
+
+  STD_TORCH_CHECK(qweight.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  const torch::stable::accelerator::DeviceGuard device_guard(qweight.get_device_index());
+
+  Tensor output =
+      torch::stable::empty({qweight_rows, qweight_cols * 8}, scales.scalar_type(), Layout::Strided, scales.device());
+
+  auto _qweight = const_cast<int*>(qweight.const_data_ptr<int>());
+  auto _zeros = const_cast<int*>(qzeros.const_data_ptr<int>());
+
+  dim3 num_blocks(x_blocks, y_blocks);
+  dim3 threads_per_block(x_num_threads, y_num_threads);
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream();
+
+  if (scales.scalar_type() == ScalarType::Half) {
+    auto _scales =
+        reinterpret_cast<half*>(const_cast<torch::headeronly::Half*>(scales.const_data_ptr<torch::headeronly::Half>()));
+    auto _output = reinterpret_cast<half*>(output.mutable_data_ptr<torch::headeronly::Half>());
+    dequantize_weights<half><<<num_blocks, threads_per_block, 0, stream>>>(
+        _qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
+  } else {
+    auto _scales = reinterpret_cast<__nv_bfloat16*>(
+        const_cast<torch::headeronly::BFloat16*>(scales.const_data_ptr<torch::headeronly::BFloat16>()));
+    auto _output = reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr<torch::headeronly::BFloat16>());
+    dequantize_weights<__nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
+        _qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
+  }
+
+  return output;
+}
+#else
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros) {
   int qweight_rows = qweight.size(0);
   int qweight_cols = qweight.size(1);
@@ -219,3 +278,4 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
 
   return output;
 }
+#endif

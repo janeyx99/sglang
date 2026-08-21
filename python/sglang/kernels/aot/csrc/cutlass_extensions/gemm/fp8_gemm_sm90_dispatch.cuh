@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include <optional>
+
 #include "cutlass_extensions/common.hpp"
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
@@ -150,7 +156,10 @@ struct sm90_fp8_config_default {
 
 template <typename Gemm, typename... EpilogueArgs>
 void cutlass_gemm_caller_sm90_fp8(
-    torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b, EpilogueArgs&&... epilogue_params) {
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    EpilogueArgs&&... epilogue_params) {
   static constexpr bool swap_ab = Gemm::swap_ab;
   using ElementAB = typename Gemm::ElementAB;
   using ElementD = typename Gemm::ElementD;
@@ -168,9 +177,9 @@ void cutlass_gemm_caller_sm90_fp8(
   StrideC c_stride =
       cutlass::make_cute_packed_stride(StrideC{}, swap_ab ? cute::make_shape(n, m, 1) : cute::make_shape(m, n, 1));
 
-  auto a_ptr = static_cast<ElementAB*>(a.data_ptr());
-  auto b_ptr = static_cast<ElementAB*>(b.data_ptr());
-  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+  auto a_ptr = const_cast<ElementAB*>(static_cast<const ElementAB*>(a.const_data_ptr()));
+  auto b_ptr = const_cast<ElementAB*>(static_cast<const ElementAB*>(b.const_data_ptr()));
+  auto c_ptr = static_cast<ElementD*>(out.mutable_data_ptr());
 
   typename GemmKernel::MainloopArguments mainloop_args =
       swap_ab ? typename GemmKernel::MainloopArguments{b_ptr, b_stride, a_ptr, a_stride}
@@ -188,11 +197,11 @@ void cutlass_gemm_caller_sm90_fp8(
 // having to remember to re-order scales per-bucket at the call site.
 template <typename Gemm, typename... EpilogueArgs>
 void cutlass_gemm_caller_sm90_fp8_scaled(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    torch::stable::Tensor const& a_scales,
+    torch::stable::Tensor const& b_scales,
     EpilogueArgs&&... epilogue_extras) {
   if constexpr (Gemm::swap_ab) {
     return cutlass_gemm_caller_sm90_fp8<Gemm>(
@@ -427,15 +436,21 @@ struct sm90_fp8_config_M16_largeN {
 
 template <typename InType, typename OutType, bool EnableBias, typename... EpilogueArgs>
 inline void cutlass_gemm_sm90_fp8_dispatch(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    torch::stable::Tensor const& a_scales,
+    torch::stable::Tensor const& b_scales,
     EpilogueArgs&&... args) {
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-  TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
+  STD_TORCH_CHECK(
+      a.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn,
+      "Expected a.dtype() == torch::kFloat8_e4m3fn to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)");
+  STD_TORCH_CHECK(
+      b.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn,
+      "Expected b.dtype() == torch::kFloat8_e4m3fn to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)");
 
   using Cutlass3xGemmDefault = typename sm90_fp8_config_default<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM128_largeN = typename sm90_fp8_config_M128_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
@@ -523,35 +538,48 @@ inline void cutlass_gemm_sm90_fp8_dispatch(
 
 template <bool EnableBias, typename... EpilogueArgs>
 void cutlass_scaled_mm_sm90_fp8_epilogue(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    torch::stable::Tensor const& a_scales,
+    torch::stable::Tensor const& b_scales,
     EpilogueArgs&&... epilogue_args) {
-  TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
+  STD_TORCH_CHECK(
+      a.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn,
+      "Expected a.dtype() == torch::kFloat8_e4m3fn to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)");
+  STD_TORCH_CHECK(
+      b.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn,
+      "Expected b.dtype() == torch::kFloat8_e4m3fn to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)");
 
-  if (out.dtype() == torch::kBFloat16) {
+  if (out.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
     return cutlass_gemm_sm90_fp8_dispatch<cutlass::float_e4m3_t, cutlass::bfloat16_t, EnableBias>(
         out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(epilogue_args)...);
   } else {
-    TORCH_CHECK(out.dtype() == torch::kFloat16);
+    STD_TORCH_CHECK(
+        out.scalar_type() == torch::headeronly::ScalarType::Half,
+        "Expected out.dtype() == torch::kFloat16 to be true, but got false.  (Could this error message be improved?  "
+        "If so, please report an enhancement request to PyTorch.)");
     return cutlass_gemm_sm90_fp8_dispatch<cutlass::float_e4m3_t, cutlass::half_t, EnableBias>(
         out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(epilogue_args)...);
   }
 }
 
 void cutlass_scaled_mm_sm90_fp8(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    std::optional<torch::Tensor> const& bias) {
-  TORCH_CHECK(a_scales.is_contiguous() && b_scales.is_contiguous());
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    torch::stable::Tensor const& a_scales,
+    torch::stable::Tensor const& b_scales,
+    std::optional<torch::stable::Tensor> const& bias) {
+  STD_TORCH_CHECK(
+      a_scales.is_contiguous() && b_scales.is_contiguous(),
+      "Expected a_scales.is_contiguous() && b_scales.is_contiguous() to be true, but got false.  (Could this error "
+      "message be improved?  If so, please report an enhancement request to PyTorch.)");
   if (bias) {
-    TORCH_CHECK(bias->dtype() == out.dtype(), "currently bias dtype must match output dtype ", out.dtype());
+    STD_TORCH_CHECK(
+        bias->scalar_type() == out.scalar_type(), "currently bias dtype must match output dtype ", out.scalar_type());
     return cutlass_scaled_mm_sm90_fp8_epilogue<true>(out, a, b, a_scales, b_scales, *bias);
   } else {
     return cutlass_scaled_mm_sm90_fp8_epilogue<false>(out, a, b, a_scales, b_scales);

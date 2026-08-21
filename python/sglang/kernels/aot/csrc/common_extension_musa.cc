@@ -16,6 +16,7 @@ limitations under the License.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
 
+#include "gemm/gemm_ops.h"
 #include "sgl_kernel_ops.h"
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 

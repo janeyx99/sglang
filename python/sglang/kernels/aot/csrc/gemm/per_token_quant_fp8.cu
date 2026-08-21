@@ -1,12 +1,124 @@
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Float8_e4m3fn.h>
+#include <torch/headeronly/util/Half.h>
+
+#include <type_traits>
+
+#include "gemm/gemm_ops.h"
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define CHECK_CUDA(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_INPUT_PTR(tensor, type) stable_input_ptr<type>(tensor)
+#define SGL_OUTPUT_Q_PTR(tensor) \
+  reinterpret_cast<__nv_fp8_e4m3*>(tensor.mutable_data_ptr<torch::headeronly::Float8_e4m3fn>())
+#define SGL_OUTPUT_S_PTR(tensor) tensor.mutable_data_ptr<float>()
+#ifdef FLASHINFER_ENABLE_BF16
+#define SGL_DISPATCH_CASE_BF16(c_type, ...) \
+  case ScalarType::BFloat16: {              \
+    using c_type = nv_bfloat16;             \
+    return __VA_ARGS__();                   \
+  }
+#else
+#define SGL_DISPATCH_CASE_BF16(c_type, ...)
+#endif
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...)                                                   \
+  [&]() -> bool {                                                                                  \
+    const auto scalar_type = TYPE;                                                                 \
+    switch (scalar_type) {                                                                         \
+      case ScalarType::Float: {                                                                    \
+        using scalar_t = float;                                                                    \
+        return __VA_ARGS__();                                                                      \
+      }                                                                                            \
+      case ScalarType::Half: {                                                                     \
+        using scalar_t = nv_half;                                                                  \
+        return __VA_ARGS__();                                                                      \
+      }                                                                                            \
+        SGL_DISPATCH_CASE_BF16(scalar_t, __VA_ARGS__)                                              \
+      default:                                                                                     \
+        STD_TORCH_CHECK(                                                                           \
+            false,                                                                                 \
+            NAME "(at::Tensor, at::Tensor, at::Tensor)::<lambda()> failed to dispatch data type ", \
+            torch::headeronly::toString(scalar_type));                                             \
+        return false;                                                                              \
+    }                                                                                              \
+  }()
+
+template <typename T>
+const T* stable_input_ptr(const Tensor& tensor) {
+  if constexpr (std::is_same_v<T, nv_half>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::Half>());
+  } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::BFloat16>());
+  } else {
+    return tensor.const_data_ptr<T>();
+  }
+}
+#else
 #include <ATen/cuda/CUDAContext.h>
+
+#include "utils.h"
+
+using Tensor = torch::Tensor;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_INPUT_PTR(tensor, type) static_cast<const type*>(tensor.data_ptr())
+#define SGL_OUTPUT_Q_PTR(tensor) static_cast<__nv_fp8_e4m3*>(tensor.data_ptr())
+#define SGL_OUTPUT_S_PTR(tensor) static_cast<float*>(tensor.data_ptr())
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...) DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(TYPE, scalar_t, __VA_ARGS__)
+#endif
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
 
-#include "utils.h"
-
 static constexpr int kWarpSize = 32;
 static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
+
+#ifdef TORCH_TARGET_VERSION
+static constexpr float FP8_E4M3_MAX = 448.0f;
+
+#define FULL_MASK 0xffffffff
+
+__device__ __forceinline__ float warpReduceMax(float value) {
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
+  return value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float value) {
+  static __shared__ float warpLevelMaxs[kWarpSize];
+  const int laneId = threadIdx.x % kWarpSize;
+  const int warpId = threadIdx.x / kWarpSize;
+
+  value = warpReduceMax(value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = value;
+  __syncthreads();
+
+  value = (threadIdx.x < blockDim.x / kWarpSize) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) value = warpReduceMax(value);
+  return value;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // 1. Warp‑local with configurable shared memory
@@ -205,9 +317,9 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
     cudaStream_t stream,
     bool use_vec16,
     bool use_vec8,
-    torch::Tensor input,
-    torch::Tensor output_q,
-    torch::Tensor output_s,
+    Tensor input,
+    Tensor output_q,
+    Tensor output_s,
     const int64_t hidden_dim,
     const int64_t num_tokens) {
   const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
@@ -215,47 +327,56 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
   if (use_vec16) {
     per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
   } else if (use_vec8) {
     per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
   } else {
     per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
   }
 }
 
-void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
+void sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
   const auto input_sizes = input.sizes();
   const int64_t num_tokens = input_sizes[0];
   const int64_t hidden_dim = input_sizes[1];
-  TORCH_CHECK(hidden_dim % 4 == 0, "Hidden dimension must be divisible by 4, but got ", hidden_dim);
+  SGL_CHECK(hidden_dim % 4 == 0, "Hidden dimension must be divisible by 4, but got ", hidden_dim);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
+#ifdef TORCH_TARGET_VERSION
+  const int sm_count = sgl_kernel::stable::get_cached_device_properties().multiProcessorCount;
+#else
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+#endif
   const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
   const bool use_vec16 = (hidden_dim % 16 == 0);
   const bool use_vec8 = (hidden_dim % 8 == 0);
 
+#ifdef TORCH_TARGET_VERSION
+  const int sizeof_T =
+      input.scalar_type() == ScalarType::Half ? 2 : (input.scalar_type() == ScalarType::BFloat16 ? 2 : 4);
+#else
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
+#endif
   const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
   const int warp_smem_stride = (hidden_dim * sizeof_T + smem_padding - 1) / smem_padding * smem_padding;
   const size_t dynamicSmemSz = warp_smem_stride * TOKENS_PER_CTA;
@@ -266,7 +387,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
     use_smem = false;  // Disable shared memory if >= 48KB to avoid allocation failures
   }
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+  SGL_DISPATCH_FLOAT_FP16(input.scalar_type(), "sgl_per_token_quant_fp8", [&] {
     if (use_warp_kernel) {
       // -------- warp‑local ---------------------------------------------------
       constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;
@@ -288,23 +409,23 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
       if (use_vec16) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 16><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
       } else if (use_vec8) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
       } else {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
+            SGL_INPUT_PTR(input, scalar_t),
+            SGL_OUTPUT_Q_PTR(output_q),
+            SGL_OUTPUT_S_PTR(output_s),
             hidden_dim,
             num_tokens);
       }
@@ -312,3 +433,19 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
     return true;
   });
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef CHECK_CUDA
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+#undef FULL_MASK
+#endif
+#undef SGL_CHECK
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_INPUT_PTR
+#undef SGL_OUTPUT_Q_PTR
+#undef SGL_OUTPUT_S_PTR
+#ifdef TORCH_TARGET_VERSION
+#undef SGL_DISPATCH_CASE_BF16
+#endif
+#undef SGL_DISPATCH_FLOAT_FP16

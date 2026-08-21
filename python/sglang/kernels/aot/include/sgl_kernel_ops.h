@@ -199,57 +199,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& positions);
 
 /*
- * From csrc/gemm
- */
-torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
-torch::Tensor int8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
-torch::Tensor fp8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
-void sgl_per_token_group_quant_8bit(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max,
-    bool scale_ue8m0);
-void sgl_per_token_group_quant_8bit_v2(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double min_8bit,
-    double max_8bit,
-    bool scale_ue8m0,
-    bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-
-torch::Tensor gptq_gemm(
-    torch::Tensor a,
-    torch::Tensor b_q_weight,
-    torch::Tensor b_gptq_qzeros,
-    torch::Tensor b_gptq_scales,
-    torch::Tensor b_g_idx,
-    bool use_shuffle,
-    int64_t bit);
-
-void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
-
-/*
  * From csrc/moe
  */
 void moe_align_block_size(

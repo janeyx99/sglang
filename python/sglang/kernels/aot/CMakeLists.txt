@@ -369,7 +369,6 @@ set(SPARSE_ATTENTION_SOURCES
 
 set(SOURCES
     ${COMMON_EXTENSION_SOURCES}
-    ${GEMM_SOURCES}
     ${MOE_SOURCES}
     ${FLASHINFER_SOURCES}
     ${SPARSE_ATTENTION_SOURCES}
@@ -380,6 +379,7 @@ set(STABLE_SOURCES
     ${ATTENTION_SOURCES}
     ${ELEMENTWISE_SOURCES}
     ${EXPERT_SPECIALIZATION_SOURCES}
+    ${GEMM_SOURCES}
     ${GRAMMAR_SOURCES}
     ${INFLLM_V2_SOURCES}
     ${KVCACHEIO_SOURCES}
@@ -474,7 +474,7 @@ target_compile_definitions(common_ops_stable_sm90_build PRIVATE
     USE_CUDA
 )
 target_include_directories(common_ops_stable_sm90_build PRIVATE ${INCLUDES})
-target_link_libraries(common_ops_stable_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+target_link_libraries(common_ops_stable_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda ${CMAKE_DL_LIBS})
 set_target_properties(common_ops_stable_sm90_build PROPERTIES
     PREFIX ""
     OUTPUT_NAME "common_ops_stable"
@@ -491,7 +491,7 @@ target_compile_definitions(common_ops_stable_sm100_build PRIVATE
     USE_CUDA
 )
 target_include_directories(common_ops_stable_sm100_build PRIVATE ${INCLUDES})
-target_link_libraries(common_ops_stable_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+target_link_libraries(common_ops_stable_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda ${CMAKE_DL_LIBS})
 set_target_properties(common_ops_stable_sm100_build PROPERTIES
     PREFIX ""
     OUTPUT_NAME "common_ops_stable"
