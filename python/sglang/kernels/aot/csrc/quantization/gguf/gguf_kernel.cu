@@ -1,13 +1,57 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <initializer_list>
+#include <optional>
+
+#include "quantization/gguf/gguf_ops.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Dispatch.h>
+#include <torch/headeronly/core/Layout.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Half.h>
+
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+using Device = torch::stable::Device;
+using SglBFloat16 = torch::headeronly::BFloat16;
+
+#define WARP_SIZE 32
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#define GGUF_DISPATCH_FLOAT_TYPES(TYPE, NAME, ...)                                                       \
+  THO_DISPATCH_SWITCH(                                                                                   \
+      TYPE,                                                                                              \
+      NAME,                                                                                              \
+      THO_DISPATCH_CASE(ScalarType::Float, __VA_ARGS__) THO_DISPATCH_CASE(ScalarType::Half, __VA_ARGS__) \
+          THO_DISPATCH_CASE(ScalarType::BFloat16, __VA_ARGS__))
+#else
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
 // dont use clang-format here, it breaks the include order
 // clang-format off
 #include "utils.h"
+
+using Tensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+using Device = c10::Device;
+using SglBFloat16 = c10::BFloat16;
+
+#define GGUF_DISPATCH_FLOAT_TYPES DISPATCH_FLOAT_TYPES
+#endif
 
 #include "ggml-common.h"
 #include "vecdotq.cuh"
@@ -17,6 +61,81 @@
 #include "moe.cuh"
 #include "moe_vec.cuh"
 // clang-format off
+
+namespace {
+
+template <typename T>
+const T* ReadPtr(const Tensor& tensor) {
+  return static_cast<const T*>(SGL_CONST_DATA_PTR(tensor));
+}
+
+template <typename T>
+T* MutablePtr(const Tensor& tensor) {
+  return static_cast<T*>(SGL_MUTABLE_DATA_PTR(tensor));
+}
+
+#ifdef TORCH_TARGET_VERSION
+torch::stable::accelerator::DeviceIndex CheckedCudaDeviceIndex(const Tensor& tensor) {
+  STD_TORCH_CHECK(tensor.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  return tensor.get_device_index();
+}
+
+class TensorDeviceGuard {
+ public:
+  explicit TensorDeviceGuard(const Tensor& tensor)
+      : device_index_(CheckedCudaDeviceIndex(tensor)), guard_(device_index_) {}
+
+  cudaStream_t current_stream() const {
+    return sgl_kernel::stable::get_current_cuda_stream(device_index_);
+  }
+
+ private:
+  torch::stable::accelerator::DeviceIndex device_index_;
+  torch::stable::accelerator::DeviceGuard guard_;
+};
+
+Tensor Empty(const Device& device, std::initializer_list<int64_t> size, ScalarType dtype) {
+  return torch::stable::empty(
+      torch::headeronly::IntHeaderOnlyArrayRef(size.begin(), size.size()),
+      dtype,
+      torch::headeronly::Layout::Strided,
+      device);
+}
+
+Tensor Zeros(const Device& device, std::initializer_list<int64_t> size, ScalarType dtype) {
+  const auto sizes = torch::headeronly::IntHeaderOnlyArrayRef(size.begin(), size.size());
+  std::array<StableIValue, 5> stack{
+      torch::stable::detail::from(sizes),
+      torch::stable::detail::from(SglOptional<ScalarType>(dtype)),
+      torch::stable::detail::from(SglOptional<torch::headeronly::Layout>(torch::headeronly::Layout::Strided)),
+      torch::stable::detail::from(SglOptional<Device>(device)),
+      torch::stable::detail::from(std::optional<bool>())};
+  TORCH_ERROR_CODE_CHECK(torch_call_dispatcher("aten::zeros", "", stack.data(), TORCH_ABI_VERSION));
+  return torch::stable::detail::to<Tensor>(stack[0]);
+}
+#else
+class TensorDeviceGuard {
+ public:
+  explicit TensorDeviceGuard(const Tensor& tensor) : guard_(device_of(tensor)) {}
+
+  cudaStream_t current_stream() const {
+    return at::cuda::getCurrentCUDAStream().stream();
+  }
+
+ private:
+  at::cuda::OptionalCUDAGuard guard_;
+};
+
+Tensor Empty(const Device& device, std::initializer_list<int64_t> size, ScalarType dtype) {
+  return torch::empty(size, torch::TensorOptions().dtype(dtype).device(device));
+}
+
+Tensor Zeros(const Device& device, std::initializer_list<int64_t> size, ScalarType dtype) {
+  return torch::zeros(size, torch::TensorOptions().dtype(dtype).device(device));
+}
+#endif
+
+}  // namespace
 
 // Q8 gemv
 template <typename scalar_t>
@@ -71,147 +190,147 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, co
   }
 }
 
-torch::Tensor ggml_dequantize(
-    torch::Tensor W,  // quant weight
+Tensor ggml_dequantize(
+    Tensor W,  // quant weight
     int64_t type,
     int64_t m,
     int64_t n,
-    std::optional<at::ScalarType> const& dtype) {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
-  auto dtype_ = dtype.value_or(torch::kFloat16);
-  auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
-  at::Tensor DW = torch::empty({m, n}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    SglOptional<SglScalarType> const& dtype) {
+  const TensorDeviceGuard device_guard(W);
+  auto dtype_ = dtype.value_or(ScalarType::Half);
+  const auto output_device = W.device();
+  Tensor DW = Empty(output_device, {m, n}, dtype_);
+  cudaStream_t stream = device_guard.current_stream();
 
-  DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
+  GGUF_DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
-    to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
+    to_cuda(ReadPtr<void>(W), MutablePtr<scalar_t>(DW), m * n, stream);
   });
 
   return DW;
 }
 
-torch::Tensor ggml_mul_mat_vec_a8(
-    torch::Tensor W,  // quant weight
-    torch::Tensor X,  // input
+Tensor ggml_mul_mat_vec_a8(
+    Tensor W,  // quant weight
+    Tensor X,  // input
     int64_t type,
     int64_t row) {
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
-  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({vecs, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
-  at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
-  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
-    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+  const TensorDeviceGuard device_guard(X);
+  const auto input_dtype = X.scalar_type();
+  const auto output_device = W.device();
+  Tensor Y = Empty(output_device, {vecs, row}, input_dtype);
+  cudaStream_t stream = device_guard.current_stream();
+  Tensor quant_X = Empty(output_device, {vecs, padded / 32 * 9}, ScalarType::Int);
+  GGUF_DISPATCH_FLOAT_TYPES(input_dtype, "ggml_mul_mat_vec_a8", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(ReadPtr<scalar_t>(X), MutablePtr<void>(quant_X), col, vecs, stream);
     switch (type) {
       case 2:
         mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 3:
         mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 6:
         mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 7:
         mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 8:
         mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 10:
         mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 11:
         mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 12:
         mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 13:
         mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 14:
         mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 16:
         mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 17:
         mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 18:
         mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 19:
         mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 20:
         mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 21:
         mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 22:
         mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 23:
         mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
       case 29:
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            ReadPtr<void>(W), ReadPtr<void>(quant_X), MutablePtr<scalar_t>(Y), col, row, vecs, stream);
         break;
     }
   });
   return Y;
 }
 
-torch::Tensor ggml_mul_mat_a8(
-    torch::Tensor W,  // quant weight
-    torch::Tensor X,  // input
+Tensor ggml_mul_mat_a8(
+    Tensor W,  // quant weight
+    Tensor X,  // input
     int64_t type,
     int64_t row) {
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
-  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({batch, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
-  at::Tensor quant_X = torch::empty({batch, padded / 32 * 9}, options);
-  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_a8", [&] {
-    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, batch, stream);
+  const TensorDeviceGuard device_guard(X);
+  const auto input_dtype = X.scalar_type();
+  const auto output_device = W.device();
+  Tensor Y = Empty(output_device, {batch, row}, input_dtype);
+  cudaStream_t stream = device_guard.current_stream();
+  Tensor quant_X = Empty(output_device, {batch, padded / 32 * 9}, ScalarType::Int);
+  GGUF_DISPATCH_FLOAT_TYPES(input_dtype, "ggml_mul_mat_a8", [&] {
+    quantize_row_q8_1_cuda(ReadPtr<scalar_t>(X), MutablePtr<void>(quant_X), col, batch, stream);
 
     switch (type) {
       case 2:
         ggml_mul_mat_q4_0_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -221,9 +340,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 3:
         ggml_mul_mat_q4_1_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -233,9 +352,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 6:
         ggml_mul_mat_q5_0_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -245,9 +364,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 7:
         ggml_mul_mat_q5_1_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -257,9 +376,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 8:
         ggml_mul_mat_q8_0_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -269,9 +388,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 10:
         ggml_mul_mat_q2_K_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -281,9 +400,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 11:
         ggml_mul_mat_q3_K_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -293,9 +412,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 12:
         ggml_mul_mat_q4_K_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -305,9 +424,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 13:
         ggml_mul_mat_q5_K_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -317,9 +436,9 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 14:
         ggml_mul_mat_q6_K_q8_1_cuda(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
             col,
             row,
             batch,
@@ -332,35 +451,35 @@ torch::Tensor ggml_mul_mat_a8(
   return Y;
 }
 
-torch::Tensor ggml_moe_a8(
-    torch::Tensor X,  // input
-    torch::Tensor W,  // expert weights
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor num_tokens_post_padded,
+Tensor ggml_moe_a8(
+    Tensor X,  // input
+    Tensor W,  // expert weights
+    Tensor sorted_token_ids,
+    Tensor expert_ids,
+    Tensor num_tokens_post_padded,
     int64_t type,
     int64_t row,
     int64_t top_k,
     int64_t tokens) {
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
-  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
-  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
-  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8", [&] {
-    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+  const TensorDeviceGuard device_guard(X);
+  const auto input_dtype = X.scalar_type();
+  const auto output_device = W.device();
+  Tensor Y = Empty(output_device, {tokens * top_k, row}, input_dtype);
+  cudaStream_t stream = device_guard.current_stream();
+  Tensor quant_X = Empty(output_device, {tokens, padded / 32 * 9}, ScalarType::Int);
+  GGUF_DISPATCH_FLOAT_TYPES(input_dtype, "ggml_moe_a8", [&] {
+    quantize_row_q8_1_cuda(ReadPtr<scalar_t>(X), MutablePtr<void>(quant_X), col, tokens, stream);
     switch (type) {
       case 2:
         ggml_moe_q4_0_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -373,12 +492,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 3:
         ggml_moe_q4_1_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -391,12 +510,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 6:
         ggml_moe_q5_0_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -409,12 +528,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 7:
         ggml_moe_q5_1_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -427,12 +546,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 8:
         ggml_moe_q8_0_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -445,12 +564,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 10:
         ggml_moe_q2_K_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -463,12 +582,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 11:
         ggml_moe_q3_K_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -481,12 +600,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 12:
         ggml_moe_q4_K_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -499,12 +618,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 13:
         ggml_moe_q5_K_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -517,12 +636,12 @@ torch::Tensor ggml_moe_a8(
         break;
       case 14:
         ggml_moe_q6_K_q8_1_cuda(
-            (void*)quant_X.data_ptr(),
-            (void*)W.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)sorted_token_ids.data_ptr(),
-            (int*)expert_ids.data_ptr(),
-            (int*)num_tokens_post_padded.data_ptr(),
+            ReadPtr<void>(quant_X),
+            ReadPtr<void>(W),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(sorted_token_ids),
+            ReadPtr<int>(expert_ids),
+            ReadPtr<int>(num_tokens_post_padded),
             W.stride(0),
             col,
             row,
@@ -538,31 +657,31 @@ torch::Tensor ggml_moe_a8(
   return Y;
 }
 
-torch::Tensor ggml_moe_a8_vec(
-    torch::Tensor X,  // input
-    torch::Tensor W,  // expert weights
-    torch::Tensor topk_ids,
+Tensor ggml_moe_a8_vec(
+    Tensor X,  // input
+    Tensor W,  // expert weights
+    Tensor topk_ids,
     int64_t top_k,
     int64_t type,
     int64_t row,
     int64_t tokens) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
-  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
-  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
-  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
-    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+  const TensorDeviceGuard device_guard(X);
+  const auto input_dtype = X.scalar_type();
+  const auto output_device = W.device();
+  Tensor Y = Zeros(output_device, {tokens * top_k, row}, input_dtype);
+  cudaStream_t stream = device_guard.current_stream();
+  Tensor quant_X = Empty(output_device, {tokens, padded / 32 * 9}, ScalarType::Int);
+  GGUF_DISPATCH_FLOAT_TYPES(input_dtype, "ggml_moe_vec_a8", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(ReadPtr<scalar_t>(X), MutablePtr<void>(quant_X), col, tokens, stream);
     switch (type) {
       case 2:
         moe_vec_q4_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -572,10 +691,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 3:
         moe_vec_q4_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -585,10 +704,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 6:
         moe_vec_q5_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -598,10 +717,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 7:
         moe_vec_q5_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -611,10 +730,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 8:
         moe_vec_q8_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -624,10 +743,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 10:
         moe_vec_q2_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -637,10 +756,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 11:
         moe_vec_q3_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -650,10 +769,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 12:
         moe_vec_q4_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -663,10 +782,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 13:
         moe_vec_q5_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -676,10 +795,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 14:
         moe_vec_q6_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -689,10 +808,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 16:
         moe_vec_iq2_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -702,10 +821,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 17:
         moe_vec_iq2_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -715,10 +834,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 18:
         moe_vec_iq3_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -728,10 +847,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 19:
         moe_vec_iq1_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -741,10 +860,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 20:
         moe_vec_iq4_nl_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -754,10 +873,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 21:
         moe_vec_iq3_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -767,10 +886,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 22:
         moe_vec_iq2_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -780,10 +899,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 23:
         moe_vec_iq4_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -793,10 +912,10 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       case 29:
         moe_vec_iq1_m_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(),
-            (void*)quant_X.data_ptr(),
-            (scalar_t*)Y.data_ptr(),
-            (int*)topk_ids.data_ptr(),
+            ReadPtr<void>(W),
+            ReadPtr<void>(quant_X),
+            MutablePtr<scalar_t>(Y),
+            ReadPtr<int>(topk_ids),
             top_k,
             tokens,
             col,
@@ -834,3 +953,10 @@ int64_t ggml_moe_get_block_size(int64_t type) {
   }
   return 0;
 }
+
+#undef GGUF_DISPATCH_FLOAT_TYPES
+#ifdef TORCH_TARGET_VERSION
+#undef SGLANG_SHFL_XOR_SYNC_WIDTH
+#undef SGLANG_SHFL_XOR_SYNC
+#undef WARP_SIZE
+#endif
