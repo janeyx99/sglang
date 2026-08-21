@@ -1,10 +1,36 @@
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <optional>
+
+#include "attention/attention_ops.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include "sgl_kernel_cuda_stream.h"
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <algorithm>
-#include <optional>
-
 #include "pytorch_extension_utils.h"
+#endif
+
+namespace {
+
+inline cudaStream_t GetCurrentCUDAStream(const SglTensor& tensor) {
+#ifdef TORCH_TARGET_VERSION
+  return sgl_kernel::stable::get_current_cuda_stream(tensor.get_device_index());
+#else
+  return at::cuda::getCurrentCUDAStream();
+#endif
+}
+
+}  // namespace
 
 // Helper functions to convert between different data types
 // (float, half, bfloat16) for the merge attention states kernel.
@@ -108,28 +134,28 @@ __global__ void merge_attn_states_kernel(
 // The following macro is used to dispatch the conversion function based on
 // the output data type. The FN is a macro that calls a function with
 // template<typename scalar_t>.
-#define DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                      \
-  {                                                                     \
-    if (scalar_dtype == at::ScalarType::Float) {                        \
-      fn(float);                                                        \
-    } else if (scalar_dtype == at::ScalarType::Half) {                  \
-      fn(half);                                                         \
-    } else if (scalar_dtype == at::ScalarType::BFloat16) {              \
-      fn(__nv_bfloat16);                                                \
-    } else {                                                            \
-      TORCH_CHECK(false, "Unsupported data type of O: ", scalar_dtype); \
-    }                                                                   \
+#define DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                          \
+  {                                                                         \
+    if (scalar_dtype == SglScalarType::Float) {                             \
+      fn(float);                                                            \
+    } else if (scalar_dtype == SglScalarType::Half) {                       \
+      fn(half);                                                             \
+    } else if (scalar_dtype == SglScalarType::BFloat16) {                   \
+      fn(__nv_bfloat16);                                                    \
+    } else {                                                                \
+      SGL_TORCH_CHECK(false, "Unsupported data type of O: ", scalar_dtype); \
+    }                                                                       \
   }
 
 #define LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS)                          \
   {                                                                              \
     merge_attn_states_kernel<scalar_t, NUM_THREADS><<<grid, block, 0, stream>>>( \
-        reinterpret_cast<scalar_t*>(output.data_ptr()),                          \
-        reinterpret_cast<float*>(output_lse.data_ptr()),                         \
-        reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),                   \
-        reinterpret_cast<float*>(prefix_lse.data_ptr()),                         \
-        reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),                   \
-        reinterpret_cast<float*>(suffix_lse.data_ptr()),                         \
+        reinterpret_cast<scalar_t*>(SGL_MUTABLE_DATA_PTR(output)),               \
+        reinterpret_cast<float*>(SGL_MUTABLE_DATA_PTR(output_lse)),              \
+        reinterpret_cast<const scalar_t*>(SGL_CONST_DATA_PTR(prefix_output)),    \
+        reinterpret_cast<const float*>(SGL_CONST_DATA_PTR(prefix_lse)),          \
+        reinterpret_cast<const scalar_t*>(SGL_CONST_DATA_PTR(suffix_output)),    \
+        reinterpret_cast<const float*>(SGL_CONST_DATA_PTR(suffix_lse)),          \
         num_tokens,                                                              \
         num_heads,                                                               \
         head_size);                                                              \
@@ -149,19 +175,19 @@ __global__ void merge_attn_states_kernel(
  */
 template <typename scalar_t>
 void merge_attn_states_launcher(
-    const at::Tensor& prefix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    const at::Tensor& prefix_lse,     // [NUM_TOKENS, NUM_HEADS]
-    const at::Tensor& suffix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    const at::Tensor& suffix_lse,     // [NUM_TOKENS, NUM_HEADS]
-    at::Tensor& output,               // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    at::Tensor& output_lse            // [NUM_TOKENS, NUM_HEADS]
+    const SglTensor& prefix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    const SglTensor& prefix_lse,     // [NUM_TOKENS, NUM_HEADS]
+    const SglTensor& suffix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    const SglTensor& suffix_lse,     // [NUM_TOKENS, NUM_HEADS]
+    SglTensor& output,               // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    SglTensor& output_lse            // [NUM_TOKENS, NUM_HEADS]
 ) {
   constexpr uint NUM_THREADS = 128;
   const uint num_tokens = output.size(0);
   const uint num_heads = output.size(1);
   const uint head_size = output.size(2);
   const uint pack_size = 16 / sizeof(scalar_t);
-  TORCH_CHECK(head_size % pack_size == 0, "headsize must be multiple of pack_size:", pack_size);
+  SGL_TORCH_CHECK(head_size % pack_size == 0, "headsize must be multiple of pack_size:", pack_size);
   // Process one pack elements per thread. for float, the
   // pack_size is 4 for half/bf16, the pack_size is 8.
   const uint threads_per_head = head_size / pack_size;
@@ -170,8 +196,12 @@ void merge_attn_states_launcher(
   dim3 block(NUM_THREADS);
   dim3 grid((total_threads + NUM_THREADS - 1) / NUM_THREADS);
 
+#ifdef TORCH_TARGET_VERSION
+  const torch::stable::accelerator::DeviceGuard device_guard(prefix_output.get_device_index());
+#else
   const c10::cuda::OptionalCUDAGuard device_guard(prefix_output.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+#endif
+  auto stream = GetCurrentCUDAStream(prefix_output);
 
   LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS);
 }
@@ -182,8 +212,67 @@ void merge_attn_states_launcher(
   }
 
 void merge_state_v2(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+    SglTensor v_a, SglTensor s_a, SglTensor v_b, SglTensor s_b, SglTensor v_merged, SglTensor s_merged) {
   // Input tensors must be contiguous
+#ifdef TORCH_TARGET_VERSION
+  STD_TORCH_CHECK(v_a.is_cuda(), "v_a must be a CUDA tensor");
+  STD_TORCH_CHECK(v_a.is_contiguous(), "v_a must be contiguous");
+  STD_TORCH_CHECK(s_a.is_cuda(), "s_a must be a CUDA tensor");
+  STD_TORCH_CHECK(s_a.is_contiguous(), "s_a must be contiguous");
+  STD_TORCH_CHECK(v_b.is_cuda(), "v_b must be a CUDA tensor");
+  STD_TORCH_CHECK(v_b.is_contiguous(), "v_b must be contiguous");
+  STD_TORCH_CHECK(s_b.is_cuda(), "s_b must be a CUDA tensor");
+  STD_TORCH_CHECK(s_b.is_contiguous(), "s_b must be contiguous");
+  const auto device_index = v_a.get_device_index();
+  const auto s_a_device_index = s_a.get_device_index();
+  const auto v_b_device_index = v_b.get_device_index();
+  const auto s_b_device_index = s_b.get_device_index();
+  STD_TORCH_CHECK(
+      s_a_device_index == device_index,
+      "CHECK_EQ(s_a.device(), device) failed. cuda:",
+      s_a_device_index,
+      " vs cuda:",
+      device_index);
+  STD_TORCH_CHECK(
+      v_b_device_index == device_index,
+      "CHECK_EQ(v_b.device(), device) failed. cuda:",
+      v_b_device_index,
+      " vs cuda:",
+      device_index);
+  STD_TORCH_CHECK(
+      s_b_device_index == device_index,
+      "CHECK_EQ(s_b.device(), device) failed. cuda:",
+      s_b_device_index,
+      " vs cuda:",
+      device_index);
+  const auto v_a_dim = v_a.dim();
+  const auto s_a_dim = s_a.dim();
+  const auto v_b_dim = v_b.dim();
+  const auto s_b_dim = s_b.dim();
+  STD_TORCH_CHECK(v_a_dim == 3, "v_a must be a 3D tensor");
+  STD_TORCH_CHECK(s_a_dim == 2, "s_a must be a 2D tensor");
+  STD_TORCH_CHECK(v_b_dim == 3, "v_b must be a 3D tensor");
+  STD_TORCH_CHECK(s_b_dim == 2, "s_b must be a 2D tensor");
+  STD_TORCH_CHECK(v_a_dim == v_b_dim, "v_a.dim() != v_b.dim(). ", v_a_dim, " vs ", v_b_dim);
+  const auto v_a_sizes = v_a.sizes();
+  const auto v_b_sizes = v_b.sizes();
+  for (int i = 0; i < v_a_dim; ++i) {
+    STD_TORCH_CHECK(v_a_sizes[i] == v_b_sizes[i], "v_a.size(", i, ") != v_b.size(", i, ")");
+  }
+  STD_TORCH_CHECK(s_a_dim == s_b_dim, "s_a.dim() != s_b.dim(). ", s_a_dim, " vs ", s_b_dim);
+  const auto s_a_sizes = s_a.sizes();
+  const auto s_b_sizes = s_b.sizes();
+  for (int i = 0; i < s_a_dim; ++i) {
+    STD_TORCH_CHECK(s_a_sizes[i] == s_b_sizes[i], "s_a.size(", i, ") != s_b.size(", i, ")");
+  }
+  const auto v_a_tokens = v_a_sizes[0];
+  const auto s_a_tokens = s_a_sizes[0];
+  STD_TORCH_CHECK(
+      v_a_tokens == s_a_tokens, "CHECK_EQ(v_a.size(0), s_a.size(0)) failed. ", v_a_tokens, " vs ", s_a_tokens);
+  const auto v_a_heads = v_a_sizes[1];
+  const auto s_b_heads = s_b_sizes[1];
+  STD_TORCH_CHECK(v_a_heads == s_b_heads, "CHECK_EQ(v_a.size(1), s_b.size(1)) failed. ", v_a_heads, " vs ", s_b_heads);
+#else
   CHECK_INPUT(v_a);  // v_a prefix_output (seq_len, num_heads, head_dim)
   CHECK_INPUT(s_a);  // s_a prefix_lse (seq_len, num_heads)
   CHECK_INPUT(v_b);  // v_b suffix_output (seq_len, num_heads, head_dim)
@@ -202,5 +291,51 @@ void merge_state_v2(
   CHECK_SHAPE(s_a, s_b);
   CHECK_EQ(v_a.size(0), s_a.size(0));
   CHECK_EQ(v_a.size(1), s_b.size(1));
+#endif
+#ifdef TORCH_TARGET_VERSION
+  const auto output_scalar_type = v_merged.scalar_type();
+  if (output_scalar_type == SglScalarType::Float) {
+    CALL_MERGE_ATTN_STATES_LAUNCHER(float);
+  } else if (output_scalar_type == SglScalarType::Half) {
+    CALL_MERGE_ATTN_STATES_LAUNCHER(half);
+  } else if (output_scalar_type == SglScalarType::BFloat16) {
+    CALL_MERGE_ATTN_STATES_LAUNCHER(__nv_bfloat16);
+  } else {
+    const char* output_type_name = torch::headeronly::toString(output_scalar_type);
+    switch (output_scalar_type) {
+      case SglScalarType::Byte:
+        output_type_name = "unsigned char";
+        break;
+      case SglScalarType::Char:
+        output_type_name = "signed char";
+        break;
+      case SglScalarType::Short:
+        output_type_name = "short int";
+        break;
+      case SglScalarType::Int:
+        output_type_name = "int";
+        break;
+      case SglScalarType::Long:
+        output_type_name = "long int";
+        break;
+      case SglScalarType::Double:
+        output_type_name = "double";
+        break;
+      case SglScalarType::Bool:
+        output_type_name = "bool";
+        break;
+      case SglScalarType::ComplexFloat:
+        output_type_name = "c10::complex<float>";
+        break;
+      case SglScalarType::ComplexDouble:
+        output_type_name = "c10::complex<double>";
+        break;
+      default:
+        break;
+    }
+    STD_TORCH_CHECK(false, "Unsupported data type of O: ", output_type_name);
+  }
+#else
   DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+#endif
 }

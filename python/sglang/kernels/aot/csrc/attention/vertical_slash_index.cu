@@ -3,9 +3,11 @@
 // This file is for blocksparse attention utils cuda kernel.
 
 #include <assert.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
-#include <torch/all.h>
+#include <cuda_runtime.h>
+
+#include "attention/attention_ops.h"
+#include "sgl_kernel_cuda_stream.h"
 
 // Save the start index of each block in the given range into block_offset.
 // Returns the updated block count.
@@ -172,12 +174,13 @@ void convert_vertical_slash_indexes_64x64(
     int64_t BLOCK_SIZE_N,
     int64_t NNZ_V,
     int64_t NNZ_S,
-    bool causal) {
+    bool causal,
+    int32_t device_index) {
   const int N_THREADS = 64;
   const dim3 dimBlock((int32_t)N_THREADS);
   const dim3 dimGrid(
       (int32_t)N_HEADS, (int32_t)BATCH_SIZE, ((int32_t)N_ROWS + (int32_t)N_THREADS - 1) / (int32_t)N_THREADS);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(device_index);
   convert_vertical_slash_indexes_kernel<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
@@ -198,19 +201,20 @@ void convert_vertical_slash_indexes_64x64(
 
 // Host function: prepares tensor pointers and launches the CUDA kernel.
 void convert_vertical_slash_indexes(
-    torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& block_offset,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
-    torch::Tensor& column_count,     // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& column_index,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
-    torch::Tensor q_seqlens,         // [BATCH, ]
-    torch::Tensor kv_seqlens,        // [BATCH, ]
-    torch::Tensor vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
-    torch::Tensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
+    SglTensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
+    SglTensor& block_offset,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    SglTensor& column_count,     // [BATCH, N_HEADS, NUM_ROWS]
+    SglTensor& column_index,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    SglTensor q_seqlens,         // [BATCH, ]
+    SglTensor kv_seqlens,        // [BATCH, ]
+    SglTensor vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
+    SglTensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
     int64_t context_size,
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
-  cudaSetDevice(q_seqlens.get_device());
+  const auto device_index = q_seqlens.get_device_index();
+  cudaSetDevice(device_index);
 
   int64_t batch_size = slash_indexes.size(0);
   int64_t num_heads = slash_indexes.size(1);
@@ -219,14 +223,14 @@ void convert_vertical_slash_indexes(
   int64_t num_rows = (context_size + block_size_M - 1) / block_size_M;
 
   convert_vertical_slash_indexes_64x64(
-      q_seqlens.data_ptr<int>(),
-      kv_seqlens.data_ptr<int>(),
-      vertical_indexes.data_ptr<int>(),
-      slash_indexes.data_ptr<int>(),
-      block_count.data_ptr<int>(),
-      block_offset.data_ptr<int>(),
-      column_count.data_ptr<int>(),
-      column_index.data_ptr<int>(),
+      q_seqlens.const_data_ptr<int>(),
+      kv_seqlens.const_data_ptr<int>(),
+      vertical_indexes.const_data_ptr<int>(),
+      slash_indexes.const_data_ptr<int>(),
+      block_count.mutable_data_ptr<int>(),
+      block_offset.mutable_data_ptr<int>(),
+      column_count.mutable_data_ptr<int>(),
+      column_index.mutable_data_ptr<int>(),
       batch_size,
       num_heads,
       num_rows,
@@ -234,7 +238,8 @@ void convert_vertical_slash_indexes(
       block_size_N,
       nnz_vertical,
       nnz_slash,
-      causal);
+      causal,
+      device_index);
 }
 
 // --- mergehead kernels --- //
@@ -378,8 +383,8 @@ void convert_vertical_slash_indexes_64x64_mergehead(
     const int* kv_seqlens,        // [BATCH, ]
     const int* vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
     const int* slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
-    int* per_head_vertical_topkv,
-    int* per_head_slash_topkv,
+    const int* per_head_vertical_topkv,
+    const int* per_head_slash_topkv,
     int* block_count,   // [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
     int* block_offset,  // [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
     int* column_count,  // [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
@@ -391,11 +396,12 @@ void convert_vertical_slash_indexes_64x64_mergehead(
     int64_t BLOCK_SIZE_N,
     int64_t NNZ_V,
     int64_t NNZ_S,
-    bool causal) {
+    bool causal,
+    int32_t device_index) {
   const int N_THREADS = 64;
   const dim3 dimBlock(N_THREADS);
   const dim3 dimGrid(N_HEADS, BATCH_SIZE, (N_ROWS + N_THREADS - 1) / N_THREADS);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(device_index);
   convert_vertical_slash_indexes_kernel_mergehead<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
@@ -418,21 +424,22 @@ void convert_vertical_slash_indexes_64x64_mergehead(
 
 // Host wrapper for mergehead kernel.
 void convert_vertical_slash_indexes_mergehead(
-    torch::Tensor& block_count,            // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& block_offset,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
-    torch::Tensor& column_count,           // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& column_index,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
-    torch::Tensor q_seqlens,               // [BATCH, ]
-    torch::Tensor kv_seqlens,              // [BATCH, ]
-    torch::Tensor vertical_indexes,        // [BATCH, N_HEADS, NNZ_V]
-    torch::Tensor slash_indexes,           // [BATCH, N_HEADS, NNZ_S]
-    torch::Tensor vertical_indices_count,  // [N_HEADS, ]
-    torch::Tensor slash_indices_count,
+    SglTensor& block_count,            // [BATCH, N_HEADS, NUM_ROWS]
+    SglTensor& block_offset,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    SglTensor& column_count,           // [BATCH, N_HEADS, NUM_ROWS]
+    SglTensor& column_index,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    SglTensor q_seqlens,               // [BATCH, ]
+    SglTensor kv_seqlens,              // [BATCH, ]
+    SglTensor vertical_indexes,        // [BATCH, N_HEADS, NNZ_V]
+    SglTensor slash_indexes,           // [BATCH, N_HEADS, NNZ_S]
+    SglTensor vertical_indices_count,  // [N_HEADS, ]
+    SglTensor slash_indices_count,
     int64_t context_size,
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
-  cudaSetDevice(q_seqlens.get_device());
+  const auto device_index = q_seqlens.get_device_index();
+  cudaSetDevice(device_index);
 
   int batch_size = slash_indexes.size(0);
   int num_heads = slash_indexes.size(1);
@@ -441,16 +448,16 @@ void convert_vertical_slash_indexes_mergehead(
   int num_rows = (context_size + block_size_M - 1) / block_size_M;
 
   convert_vertical_slash_indexes_64x64_mergehead(
-      q_seqlens.data_ptr<int>(),
-      kv_seqlens.data_ptr<int>(),
-      vertical_indexes.data_ptr<int>(),
-      slash_indexes.data_ptr<int>(),
-      vertical_indices_count.data_ptr<int>(),
-      slash_indices_count.data_ptr<int>(),
-      block_count.data_ptr<int>(),
-      block_offset.data_ptr<int>(),
-      column_count.data_ptr<int>(),
-      column_index.data_ptr<int>(),
+      q_seqlens.const_data_ptr<int>(),
+      kv_seqlens.const_data_ptr<int>(),
+      vertical_indexes.const_data_ptr<int>(),
+      slash_indexes.const_data_ptr<int>(),
+      vertical_indices_count.const_data_ptr<int>(),
+      slash_indices_count.const_data_ptr<int>(),
+      block_count.mutable_data_ptr<int>(),
+      block_offset.mutable_data_ptr<int>(),
+      column_count.mutable_data_ptr<int>(),
+      column_index.mutable_data_ptr<int>(),
       batch_size,
       num_heads,
       num_rows,
@@ -458,5 +465,6 @@ void convert_vertical_slash_indexes_mergehead(
       block_size_N,
       nnz_vertical,
       nnz_slash,
-      causal);
+      causal,
+      device_index);
 }

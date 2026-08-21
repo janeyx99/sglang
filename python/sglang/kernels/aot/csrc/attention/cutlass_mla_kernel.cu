@@ -15,42 +15,59 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/kernel_hardware_info.h>
-#include <torch/all.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/headeronly/core/ScalarType.h>
 
 #include <cute/tensor.hpp>
 #include <iostream>
 
+#include "attention/attention_ops.h"
 #include "cutlass_sm100_mla/device/sm100_mla.hpp"
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
-#include "utils.h"
+#include "sgl_kernel_cuda_stream.h"
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
 void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope,
-    torch::Tensor const& q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
+    SglTensor const& out,
+    SglTensor const& q_nope,
+    SglTensor const& q_pe,
+    SglTensor const& kv_c_and_k_pe_cache,
+    SglTensor const& seq_lens,
+    SglTensor const& page_table,
+    SglTensor const& workspace,
+    double sm_scale,
     int64_t num_kv_splits) {
-  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_decode");
+  STD_TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_decode");
 }
 int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
-  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
+  STD_TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
 }
 #else
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
     cutlass::Status error = status;                                                 \
-    TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+    STD_TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
+
+namespace {
+
+int GetSMVersion() {
+  int device = -1;
+  STD_CUDA_CHECK(cudaGetDevice(&device));
+  int sm_major = 0;
+  int sm_minor = 0;
+  STD_CUDA_CHECK(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+  STD_CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
+  return sm_major * 10 + sm_minor;
+}
+
+}  // namespace
 
 using namespace cute;
 using namespace cutlass::fmha::kernel;
@@ -94,16 +111,16 @@ struct MlaSm100 {
 
 template <typename T>
 typename T::Fmha::Arguments args_from_options(
-    at::Tensor const& out,
-    at::Tensor const& q_nope,
-    at::Tensor const& q_pe,
-    at::Tensor const& kv_c_and_k_pe_cache,
-    at::Tensor const& seq_lens,
-    at::Tensor const& page_table,
+    SglTensor const& out,
+    SglTensor const& q_nope,
+    SglTensor const& q_pe,
+    SglTensor const& kv_c_and_k_pe_cache,
+    SglTensor const& seq_lens,
+    SglTensor const& page_table,
     double sm_scale,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = q_nope.device().index();
+  hw_info.device_id = q_nope.get_device_index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   int batches = q_nope.size(0);
@@ -139,9 +156,9 @@ typename T::Fmha::Arguments args_from_options(
   using Element = typename T::Element;
   using ElementOut = typename T::ElementOut;
   using ElementAcc = typename T::ElementAcc;
-  auto Q_nope_ptr = static_cast<Element*>(q_nope.data_ptr());
-  auto Q_pe_ptr = static_cast<Element*>(q_pe.data_ptr());
-  auto C_ptr = static_cast<Element*>(kv_c_and_k_pe_cache.data_ptr());
+  auto Q_nope_ptr = const_cast<Element*>(static_cast<const Element*>(q_nope.const_data_ptr()));
+  auto Q_pe_ptr = const_cast<Element*>(static_cast<const Element*>(q_pe.const_data_ptr()));
+  auto C_ptr = const_cast<Element*>(static_cast<const Element*>(kv_c_and_k_pe_cache.const_data_ptr()));
   typename T::Fmha::Arguments arguments{
       problem_shape,
       {scale,
@@ -153,12 +170,12 @@ typename T::Fmha::Arguments args_from_options(
        stride_C,
        C_ptr + D_latent,
        stride_C,
-       static_cast<int*>(seq_lens.data_ptr()),
-       static_cast<int*>(page_table.data_ptr()),
+       const_cast<int*>(static_cast<const int*>(seq_lens.const_data_ptr())),
+       const_cast<int*>(static_cast<const int*>(page_table.const_data_ptr())),
        stride_PT,
        page_count_total,
        page_size},
-      {static_cast<ElementOut*>(out.data_ptr()), stride_O, static_cast<ElementAcc*>(nullptr), stride_LSE},
+      {static_cast<ElementOut*>(out.mutable_data_ptr()), stride_O, static_cast<ElementAcc*>(nullptr), stride_LSE},
       hw_info,
       // TODO(trevor-m): Change split_kv back to -1 when
       // https://github.com/NVIDIA/cutlass/issues/2274 is fixed. Split_kv=1 will
@@ -176,13 +193,13 @@ typename T::Fmha::Arguments args_from_options(
 
 template <typename Element, bool IsPaged128, typename PersistenceOption>
 void runMla(
-    at::Tensor const& out,
-    at::Tensor const& q_nope,
-    at::Tensor const& q_pe,
-    at::Tensor const& kv_c_and_k_pe_cache,
-    at::Tensor const& seq_lens,
-    at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    SglTensor const& out,
+    SglTensor const& q_nope,
+    SglTensor const& q_pe,
+    SglTensor const& kv_c_and_k_pe_cache,
+    SglTensor const& seq_lens,
+    SglTensor const& page_table,
+    SglTensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits,
     cudaStream_t stream) {
@@ -192,9 +209,9 @@ void runMla(
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
-  CUTLASS_CHECK(fmha.initialize(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(fmha.initialize(arguments, workspace.mutable_data_ptr(), stream));
 
-  CUTLASS_CHECK(fmha.run(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(fmha.run(arguments, workspace.mutable_data_ptr(), stream));
 }
 
 #define DISPATCH_BOOL(expr, const_expr, ...) \
@@ -209,22 +226,24 @@ void runMla(
   }()
 
 void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope,
-    torch::Tensor const& q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
+    SglTensor const& out,
+    SglTensor const& q_nope,
+    SglTensor const& q_pe,
+    SglTensor const& kv_c_and_k_pe_cache,
+    SglTensor const& seq_lens,
+    SglTensor const& page_table,
+    SglTensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  auto sm_version = getSMVersion();
+  auto sm_version = GetSMVersion();
   // On SM103a, half of the accuracy tests are failing.
-  TORCH_CHECK(sm_version == 100, "cutlass_mla_decode is only supported on compute capability 10.0, but found sm version ", sm_version);
+  STD_TORCH_CHECK(sm_version == 100, "cutlass_mla_decode is only supported on compute capability 10.0, but found sm version ", sm_version);
 
-  auto in_dtype = q_nope.dtype();
-  at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
+  auto in_dtype = q_nope.scalar_type();
+  STD_TORCH_CHECK(q_nope.is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu");
+  const auto device_index = q_nope.get_device_index();
+  torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(device_index);
   const int page_size = kv_c_and_k_pe_cache.size(1);
 
   // NOTE(alcanderian): IsPersistent has bug with manual split_kv.
@@ -232,17 +251,17 @@ void cutlass_mla_decode(
   // Maybe per batch split kv will fix this.
   DISPATCH_BOOL(page_size == 128, IsPaged128, [&] {
     DISPATCH_BOOL(num_kv_splits <= 1, NotManualSplitKV, [&] {
-      if (in_dtype == at::ScalarType::Half) {
+      if (in_dtype == torch::headeronly::ScalarType::Half) {
         runMla<cutlass::half_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
           out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits, stream);
-      } else if (in_dtype == at::ScalarType::BFloat16) {
+      } else if (in_dtype == torch::headeronly::ScalarType::BFloat16) {
         runMla<cutlass::bfloat16_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
           out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits, stream);
-      } else if (in_dtype == at::ScalarType::Float8_e4m3fn) {
+      } else if (in_dtype == torch::headeronly::ScalarType::Float8_e4m3fn) {
         runMla<cutlass::float_e4m3_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
           out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits, stream);
       } else {
-        TORCH_CHECK(false, "Unsupported input data type of MLA");
+        STD_TORCH_CHECK(false, "Unsupported input data type of MLA");
       }
       return true;
     });
