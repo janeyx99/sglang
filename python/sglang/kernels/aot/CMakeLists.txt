@@ -16,6 +16,24 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 # GitHub Artifactory
 set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 
+# Empty keeps the release architecture matrix. A native development wheel may
+# select, for example, 100f to compile and test every extension on GB300.
+set(SGL_KERNEL_CUDA_ARCHITECTURES "" CACHE STRING "Optional CUDA architectures, e.g. 90a;100f")
+function(sgl_kernel_override_architectures flags_variable)
+    if(NOT SGL_KERNEL_CUDA_ARCHITECTURES)
+        return()
+    endif()
+    set(flags ${${flags_variable}})
+    list(FILTER flags EXCLUDE REGEX "^-gencode=")
+    foreach(arch IN LISTS SGL_KERNEL_CUDA_ARCHITECTURES)
+        if(NOT arch MATCHES "^[0-9]+[af]?$")
+            message(FATAL_ERROR "Invalid CUDA architecture: ${arch}")
+        endif()
+        list(APPEND flags "-gencode=arch=compute_${arch},code=sm_${arch}")
+    endforeach()
+    set(${flags_variable} ${flags} PARENT_SCOPE)
+endfunction()
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -236,6 +254,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+sgl_kernel_override_architectures(SGL_KERNEL_CUDA_FLAGS)
+
 # All source files
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
@@ -316,7 +336,7 @@ target_compile_options(common_ops_stable_sm90_build PRIVATE
 target_include_directories(common_ops_stable_sm90_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
 set_target_properties(common_ops_stable_sm90_build PROPERTIES
-    OUTPUT_NAME "common_ops_stable"
+    OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
@@ -331,7 +351,7 @@ target_compile_options(common_ops_stable_sm100_build PRIVATE
 target_include_directories(common_ops_stable_sm100_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
 set_target_properties(common_ops_stable_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops_stable"
+    OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
 
@@ -360,25 +380,8 @@ target_link_libraries(common_ops_stable_sm100_build PRIVATE ${TORCH_LIBRARIES} c
 install(TARGETS common_ops_stable_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_stable_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
-# apply_gguf_moe_weights uses ATen overlap validation with no stable 2.11 shim.
-# Keep it in the legacy companion until those checks can be preserved via stable APIs.
-foreach(arch IN ITEMS 90 100)
-    Python_add_library(common_ops_sm${arch}_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
-        csrc/moe/moe_sum.cu csrc/registration/common_legacy_ops.cc)
-    target_compile_options(common_ops_sm${arch}_build PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-    if(arch STREQUAL "90")
-        target_compile_options(common_ops_sm${arch}_build PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
-    endif()
-    target_include_directories(common_ops_sm${arch}_build PRIVATE ${INCLUDES})
-    target_link_libraries(common_ops_sm${arch}_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-    set_target_properties(common_ops_sm${arch}_build PROPERTIES
-        OUTPUT_NAME "common_ops" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm${arch}")
-    install(TARGETS common_ops_sm${arch}_build LIBRARY DESTINATION sgl_kernel/sm${arch})
-endforeach()
-
 # ===================== InfLLM-V2 FlashAttention backend ===================== #
-# Standalone pybind extension `infllm_ops`, vendored from
+# Standalone stable dispatcher library `infllm_ops`, vendored from
 # 3rdparty/infllmv2_cuda_impl. Kept as its own module so its `flash::` symbols
 # stay isolated from sgl-kernel's other extension modules. Mirrors the original
 # setup.py: only hdim 64/128 bf16 forward instantiations are compiled (the
@@ -416,6 +419,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
 endif()
 
+sgl_kernel_override_architectures(INFLLM_FLASH_CUDA_FLAGS)
+
 set(INFLLM_FLASH_SOURCES
     "csrc/infllm_v2/flash_extension.cc"
     "csrc/infllm_v2/flash_attn/flash_api.cpp"
@@ -425,7 +430,11 @@ set(INFLLM_FLASH_SOURCES
     "csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu"
 )
 
-Python_add_library(infllm_ops MODULE WITH_SOABI ${INFLLM_FLASH_SOURCES})
+Python_add_library(infllm_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${INFLLM_FLASH_SOURCES})
+target_compile_definitions(infllm_ops PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL USE_CUDA
+    FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_ALIBI
+    FLASHATTENTION_DISABLE_SOFTCAP FLASHATTENTION_DISABLE_UNEVEN_K FLASHATTENTION_DISABLE_LOCAL)
 target_compile_options(infllm_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFLLM_FLASH_CUDA_FLAGS}>)
 target_include_directories(infllm_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/include
@@ -433,8 +442,5 @@ target_include_directories(infllm_ops PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn
     ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn/src
 )
-# The pybind module binds functions taking at::Generator, which pulls in
-# THPGeneratorClass from libtorch_python (not part of TORCH_LIBRARIES).
-find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
-target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
+target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "gguf_moe_weights.cuh"
 #include "moe/moe_ops.h"
 #include "sgl_kernel_cuda_stream.h"
 
@@ -110,6 +111,98 @@ void moe_sum(
       break;
     }
   }
+}
+
+// ATen only checks byte intervals for non-overlapping dense inputs; it
+// deliberately leaves other strided inputs to the caller. Outputs have already
+// been checked contiguous. These are rank-two tensors with nonnegative strides.
+static void assert_no_dense_overlap(const Tensor& outputs, const Tensor& input) {
+  if (outputs.numel() == 0 || input.numel() == 0) {
+    return;
+  }
+  const bool dense = input.size(0) <= 1   ? (input.size(1) <= 1 || input.stride(1) == 1)
+                     : input.size(1) <= 1 ? input.stride(0) == 1
+                                          : (input.stride(1) == 1 && input.stride(0) == input.size(1)) ||
+                                                (input.stride(0) == 1 && input.stride(1) == input.size(0));
+  if (!dense) {
+    return;
+  }
+  const auto output_begin = reinterpret_cast<uintptr_t>(outputs.const_data_ptr());
+  const auto input_begin = reinterpret_cast<uintptr_t>(input.const_data_ptr());
+  const auto output_end = output_begin + outputs.numel() * outputs.element_size();
+  const auto input_end = input_begin + input.numel() * input.element_size();
+  STD_TORCH_CHECK(
+      output_begin >= input_end || input_begin >= output_end,
+      "unsupported operation: some elements of the input tensor and "
+      "the written-to tensor refer to a single memory location. "
+      "Please clone() the tensor before performing the operation.");
+}
+
+void apply_gguf_moe_weights(Tensor& outputs, const Tensor& weights, const Tensor& ids) {
+  STD_TORCH_CHECK(outputs.is_cuda(), "outputs must be a CUDA tensor");
+
+  STD_TORCH_CHECK(
+      weights.device() == outputs.device() && ids.device() == outputs.device(), "tensors must share a device");
+  STD_TORCH_CHECK(
+      outputs.layout() == torch::headeronly::Layout::Strided &&
+          weights.layout() == torch::headeronly::Layout::Strided && ids.layout() == torch::headeronly::Layout::Strided,
+      "tensors must have strided layout");
+  STD_TORCH_CHECK(
+      outputs.dim() == 2 && outputs.is_contiguous(), "outputs must be contiguous [tokens * topk, hidden_size]");
+  STD_TORCH_CHECK(weights.dim() == 2 && ids.dim() == 2, "weights and ids must have shape [tokens, topk]");
+  STD_TORCH_CHECK(weights.sizes().equals(ids.sizes()), "weights and ids shapes must match");
+  STD_TORCH_CHECK(outputs.size(0) == weights.numel(), "outputs rows must equal tokens * topk");
+  const auto supported_float = [](ScalarType dtype) {
+    return dtype == ScalarType::Half || dtype == ScalarType::BFloat16 || dtype == ScalarType::Float;
+  };
+  STD_TORCH_CHECK(supported_float(outputs.scalar_type()), "outputs must be float16, bfloat16, or float32");
+  STD_TORCH_CHECK(supported_float(weights.scalar_type()), "weights must be float16, bfloat16, or float32");
+  STD_TORCH_CHECK(
+      ids.scalar_type() == ScalarType::Int || ids.scalar_type() == ScalarType::Long, "ids must be int32 or int64");
+  STD_TORCH_CHECK(
+      weights.stride(0) >= 0 && weights.stride(1) >= 0 && ids.stride(0) >= 0 && ids.stride(1) >= 0,
+      "weights and ids strides must be nonnegative");
+  assert_no_dense_overlap(outputs, weights);
+  assert_no_dense_overlap(outputs, ids);
+  const int64_t numel = outputs.numel();
+  if (numel == 0) {
+    return;
+  }
+  const torch::stable::accelerator::DeviceGuard device_guard(outputs.get_device_index());
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(outputs.get_device_index());
+
+  constexpr int threads = 256;
+  // Reuse each route's ID and score across four coalesced column groups.
+  constexpr int columns_per_block = threads * 4;
+  const dim3 blocks(
+      static_cast<unsigned int>(std::min<int64_t>(outputs.size(0), 65535)),
+      static_cast<unsigned int>(std::min<int64_t>((outputs.size(1) - 1) / columns_per_block + 1, 65535)));
+  STABLE_DISPATCH_FLOAT_TYPES(outputs.scalar_type(), "apply_gguf_moe_weights_output", [&] {
+    using output_t = scalar_t;
+    STABLE_DISPATCH_FLOAT_TYPES(weights.scalar_type(), "apply_gguf_moe_weights_weight", [&] {
+      using weight_t = scalar_t;
+      const auto launch = [&](auto* id_data) {
+        apply_gguf_moe_weights_kernel<<<blocks, threads, 0, stream>>>(
+            outputs.mutable_data_ptr<output_t>(),
+            weights.const_data_ptr<weight_t>(),
+            id_data,
+            outputs.size(0),
+            outputs.size(1),
+            weights.size(1),
+            weights.stride(0),
+            weights.stride(1),
+            ids.stride(0),
+            ids.stride(1));
+      };
+      if (ids.scalar_type() == ScalarType::Int) {
+        launch(ids.const_data_ptr<int32_t>());
+      } else {
+        launch(ids.const_data_ptr<int64_t>());
+      }
+    });
+  });
+  const auto error = cudaGetLastError();
+  STD_TORCH_CHECK(error == cudaSuccess, "apply_gguf_moe_weights launch failed: ", cudaGetErrorString(error));
 }
 
 #undef STABLE_DISPATCH_FLOAT_TYPES

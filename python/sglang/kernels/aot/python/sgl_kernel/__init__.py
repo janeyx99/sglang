@@ -13,16 +13,13 @@ else:
     from sgl_kernel.load_utils import (
         _check_stable_torch_runtime,
         _load_architecture_specific_ops,
-        _load_stable_ops,
         _preload_cuda_library,
     )
 
     # Initialize the ops library based on current GPU
     if torch.version.cuda is not None:
         _check_stable_torch_runtime()
-    _common_ops_path = _load_architecture_specific_ops()
-    if torch.version.cuda is not None:
-        _load_stable_ops(_common_ops_path)
+    _load_architecture_specific_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:

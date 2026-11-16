@@ -1,19 +1,19 @@
-"""Robust loader for the standalone ``infllm_ops`` pybind extension.
+"""Load the standalone ``infllm_ops`` stable dispatcher library.
 
 The InfLLM-V2 FlashAttention backend is built as its own module ``infllm_ops``
 (installed into the ``sgl_kernel`` package directory). Under editable installs
 the compiled ``.so`` may live in ``site-packages/sgl_kernel`` while the imported
-``sgl_kernel`` package resolves to the source tree, so a plain ``from sgl_kernel
-import infllm_ops`` is not always sufficient. This loader searches the known
-candidate locations and loads the extension by file path.
+``sgl_kernel`` package resolves to the source tree. This loader searches the
+known candidate locations and registers the operators by file path.
 """
 
 import glob
-import importlib.util
 import site
 import sys
 from pathlib import Path
 from typing import List, Optional
+
+import torch
 
 _infllm_ops = None
 
@@ -68,19 +68,10 @@ def _find_so() -> Optional[Path]:
 
 
 def load_infllm_ops():
-    """Import and return the ``infllm_ops`` extension module (cached)."""
+    """Load the library and return its dispatcher namespace (cached)."""
     global _infllm_ops
     if _infllm_ops is not None:
         return _infllm_ops
-
-    # Fast path: a normal import may already work.
-    try:
-        from sgl_kernel import infllm_ops as _mod  # type: ignore
-
-        _infllm_ops = _mod
-        return _infllm_ops
-    except Exception:
-        pass
 
     so_path = _find_so()
     if so_path is None:
@@ -89,10 +80,6 @@ def load_infllm_ops():
             "Ensure sgl-kernel was built with the InfLLM-V2 FlashAttention backend."
         )
 
-    spec = importlib.util.spec_from_file_location("infllm_ops", str(so_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"[sgl_kernel] Could not create module spec for {so_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _infllm_ops = module
+    torch.ops.load_library(str(so_path))
+    _infllm_ops = torch.ops.infllm_ops
     return _infllm_ops

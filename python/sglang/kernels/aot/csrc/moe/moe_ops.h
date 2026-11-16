@@ -19,6 +19,8 @@ limitations under the License.
 
 #include "sgl_kernel_torch_compat.h"
 
+void apply_gguf_moe_weights(SglTensor& outputs, const SglTensor& weights, const SglTensor& ids);
+
 void moe_align_block_size(
     SglTensor topk_ids,
     int64_t num_experts,

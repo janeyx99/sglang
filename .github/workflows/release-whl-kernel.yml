@@ -77,6 +77,11 @@ jobs:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
 
+      - name: Audit every native CUDA library
+        run: |
+          python -m pip install packaging torch-abi-audit
+          python scripts/audit_cuda_wheels.py python/sglang/kernels/aot/dist/*.whl
+
       - name: Strip +cu130 local version for PyPI upload
         working-directory: python/sglang/kernels/aot
         run: |

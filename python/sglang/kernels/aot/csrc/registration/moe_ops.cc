@@ -34,6 +34,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
 
+  m.def("apply_gguf_moe_weights(Tensor! outputs, Tensor weights, Tensor ids) -> ()");
+
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
   // now routes through the unified Triton router
   // (python/sglang/kernels/ops/moe/moe_fused_gate.py).
@@ -81,6 +83,7 @@ STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
   m.impl("topk_sigmoid", TORCH_BOX(&topk_sigmoid));
   m.impl("moe_sum_reduce", TORCH_BOX(&moe_sum_reduce));
   m.impl("moe_sum", TORCH_BOX(&moe_sum));
+  m.impl("apply_gguf_moe_weights", TORCH_BOX(&apply_gguf_moe_weights));
   m.impl("fp8_blockwise_scaled_grouped_mm", TORCH_BOX(&fp8_blockwise_scaled_grouped_mm));
   m.impl("prepare_moe_input", TORCH_BOX(&prepare_moe_input));
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));

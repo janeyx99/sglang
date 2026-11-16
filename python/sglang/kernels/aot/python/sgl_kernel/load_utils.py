@@ -226,26 +226,3 @@ def _preload_cuda_library():
                     continue
 
     logger.debug("[sgl_kernel] Could not preload CUDA runtime library")
-
-
-def _load_stable_ops(common_ops_path: Path):
-    """Load the stable common ops library next to the selected legacy library."""
-    ops_pattern = str(common_ops_path.parent / "common_ops_stable.*")
-    raw_matching_files = glob.glob(ops_pattern)
-    matching_files = _filter_compiled_extensions(raw_matching_files)
-
-    logger.debug(
-        f"[sgl_kernel] Looking for stable library matching pattern: {ops_pattern}"
-    )
-    logger.debug(f"[sgl_kernel] Found stable files: {raw_matching_files}")
-
-    if not matching_files:
-        raise ImportError(
-            f"[sgl_kernel] Could not find common_ops_stable next to {common_ops_path}"
-        )
-
-    ops_path = Path(matching_files[0])
-    logger.debug(f"[sgl_kernel] Loading stable ops library from {ops_path}...")
-    torch.ops.load_library(str(ops_path))
-    logger.debug("[sgl_kernel] ✓ Successfully loaded stable common ops")
-    logger.debug(f"[sgl_kernel] ✓ Library file: {ops_path}")
