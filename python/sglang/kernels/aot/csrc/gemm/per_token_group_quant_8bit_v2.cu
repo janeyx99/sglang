@@ -1,10 +1,146 @@
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Float8_e4m3fn.h>
+#include <torch/headeronly/util/Half.h>
+
+#include <cstdlib>
+#include <mutex>
+#include <optional>
+#include <type_traits>
+
+#include "gemm/gemm_ops.h"
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition)                                                                   \
+  STD_TORCH_CHECK(                                                                                    \
+      condition,                                                                                      \
+      "Expected " #condition                                                                          \
+      " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+      "enhancement request to PyTorch.)")
+#define CHECK_CUDA(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_EQ(a, b) STD_TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_GET_ENV_ENABLE_PDL() stable_get_env_enable_pdl()
+#define SGL_INPUT_PTR(tensor, type) stable_input_ptr<type>(tensor)
+#define SGL_OUTPUT_Q_PTR(tensor, type) stable_output_q_ptr<type>(tensor)
+#define SGL_OUTPUT_S_PTR(tensor, type) stable_output_s_ptr<type>(tensor)
+#define SGL_MASKED_M_PTR(optional_tensor) stable_masked_m_ptr(optional_tensor)
+#define SGL_OPTIONAL_TENSOR_ARG const std::optional<Tensor>& masked_m
+#ifdef FLASHINFER_ENABLE_BF16
+#define SGL_DISPATCH_CASE_BF16(c_type, ...) \
+  case ScalarType::BFloat16: {              \
+    using c_type = nv_bfloat16;             \
+    return __VA_ARGS__();                   \
+  }
+#else
+#define SGL_DISPATCH_CASE_BF16(c_type, ...)
+#endif
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...)                                           \
+  [&]() -> bool {                                                                          \
+    const auto scalar_type = TYPE;                                                         \
+    switch (scalar_type) {                                                                 \
+      case ScalarType::Half: {                                                             \
+        using scalar_t = nv_half;                                                          \
+        return __VA_ARGS__();                                                              \
+      }                                                                                    \
+        SGL_DISPATCH_CASE_BF16(scalar_t, __VA_ARGS__)                                      \
+      default:                                                                             \
+        STD_TORCH_CHECK(                                                                   \
+            false,                                                                         \
+            NAME                                                                           \
+            "(at::Tensor, at::Tensor, at::Tensor, int64_t, double, double, double, bool, " \
+            "bool, const std::optional<at::Tensor>&)::<lambda()> failed to dispatch data " \
+            "type ",                                                                       \
+            torch::headeronly::toString(scalar_type));                                     \
+        return false;                                                                      \
+    }                                                                                      \
+  }()
+
+inline bool stable_get_env_enable_pdl() {
+  static std::once_flag flag;
+  static bool enable_pdl = false;
+  std::call_once(flag, []() {
+    const auto& prop = sgl_kernel::stable::get_cached_device_properties();
+    if (prop.major * 10 + prop.minor >= 90) {
+      const char* env = std::getenv("TRTLLM_ENABLE_PDL");
+      enable_pdl = env != nullptr && env[0] == '1' && env[1] == '\0';
+    }
+  });
+  return enable_pdl;
+}
+
+template <typename T>
+const T* stable_input_ptr(const Tensor& tensor) {
+  if constexpr (std::is_same_v<T, nv_half>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::Half>());
+  } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::BFloat16>());
+  } else {
+    return tensor.const_data_ptr<T>();
+  }
+}
+
+template <typename T>
+T* stable_output_q_ptr(Tensor& tensor) {
+  if constexpr (std::is_same_v<T, int8_t>) {
+    return tensor.mutable_data_ptr<int8_t>();
+  } else {
+    static_assert(std::is_same_v<T, torch::headeronly::Float8_e4m3fn>);
+    return tensor.mutable_data_ptr<torch::headeronly::Float8_e4m3fn>();
+  }
+}
+
+template <typename T>
+T* stable_output_s_ptr(Tensor& tensor) {
+  if constexpr (std::is_same_v<T, uint32_t>) {
+    return reinterpret_cast<T*>(tensor.mutable_data_ptr<int32_t>());
+  } else {
+    static_assert(std::is_same_v<T, float>);
+    return tensor.mutable_data_ptr<float>();
+  }
+}
+
+const int32_t* stable_masked_m_ptr(const std::optional<Tensor>& masked_m) {
+  return masked_m.has_value() ? masked_m->const_data_ptr<int32_t>() : nullptr;
+}
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
 
+#include "utils.h"
+
+using Tensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition) TORCH_CHECK(condition)
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_GET_ENV_ENABLE_PDL() getEnvEnablePDL()
+#define SGL_INPUT_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_OUTPUT_Q_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_OUTPUT_S_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_MASKED_M_PTR(optional_tensor) \
+  static_cast<int32_t*>(optional_tensor.has_value() ? optional_tensor->data_ptr() : 0)
+#define SGL_OPTIONAL_TENSOR_ARG const std::optional<Tensor>& masked_m
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...) DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(TYPE, scalar_t, __VA_ARGS__)
+#endif
+
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
-
-#include "utils.h"
 
 template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
@@ -121,7 +257,7 @@ struct DtypeInfo<int8_t> {
 };
 
 template <>
-struct DtypeInfo<c10::Float8_e4m3fn> {
+struct DtypeInfo<torch::headeronly::Float8_e4m3fn> {
   static constexpr float MIN = -448;
   static constexpr float MAX = 448;
 };
@@ -214,7 +350,7 @@ struct MaskedLayoutScheduler {
       dim3& grid,
       dim3& block) {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
-    TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
+    SGL_CHECK_NO_MSG(hidden_dim_num_groups % subwarps_per_block == 0);
     grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
@@ -372,7 +508,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         int4 output_buf;
         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
 
-        if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+        if constexpr (std::is_same_v<DST_DTYPE, torch::headeronly::Float8_e4m3fn>) {
           const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
           static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
           static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
@@ -412,31 +548,31 @@ void sgl_per_token_group_quant_8bit_v2(
     // vanilla: (num_tokens, hidden_size)
     // fuse_silu_and_mul: (num_tokens, hidden_size * 2)
     // fuse_silu_and_mul + masked_layout: (num_experts, num_tokens-with-padding, hidden_size * 2)
-    torch::Tensor input,
-    torch::Tensor output_q,
-    torch::Tensor output_s,
+    Tensor input,
+    Tensor output_q,
+    Tensor output_s,
     int64_t group_size,
     double eps,
     double min_8bit,
     double max_8bit,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m) {
+    SGL_OPTIONAL_TENSOR_ARG) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
-  TORCH_CHECK(input.numel() > 0);
+  SGL_CHECK_NO_MSG(input.numel() > 0);
 
-  TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
+  SGL_CHECK_NO_MSG(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(input.numel() % group_size, 0);
   const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
-  TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
+  SGL_CHECK_NO_MSG(output_s.dim() == (masked_layout ? 3 : 2));
 
   const int num_local_experts = masked_layout ? input.size(0) : 1;
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
 
   auto dst_type = output_q.scalar_type();
 
@@ -460,16 +596,16 @@ void sgl_per_token_group_quant_8bit_v2(
     config.stream = stream;                                                                                          \
     cudaLaunchAttribute attrs[1];                                                                                    \
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                \
-    attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();                                         \
+    attrs[0].val.programmaticStreamSerializationAllowed = SGL_GET_ENV_ENABLE_PDL();                                  \
     config.numAttrs = 1;                                                                                             \
     config.attrs = attrs;                                                                                            \
     cudaLaunchKernelEx(                                                                                              \
         &config,                                                                                                     \
         per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>,    \
-        static_cast<T*>(input.data_ptr()),                                                                           \
-        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                                \
-        static_cast<output_s_dtype*>(output_s.data_ptr()),                                                           \
-        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                      \
+        SGL_INPUT_PTR(input, T),                                                                                     \
+        SGL_OUTPUT_Q_PTR(output_q, DST_DTYPE),                                                                       \
+        SGL_OUTPUT_S_PTR(output_s, output_s_dtype),                                                                  \
+        SGL_MASKED_M_PTR(masked_m),                                                                                  \
         subwarps_per_block,                                                                                          \
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
@@ -480,7 +616,7 @@ void sgl_per_token_group_quant_8bit_v2(
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
   do {                                                                                                              \
     constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                                                            \
-    TORCH_CHECK(THREADS_PER_SUBWARP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                       \
+    SGL_CHECK_NO_MSG(THREADS_PER_SUBWARP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                  \
                                                                                                                     \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                                    \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                                        \
@@ -507,31 +643,31 @@ void sgl_per_token_group_quant_8bit_v2(
     }                                                                                                               \
   } while (0)
 
-#define LAUNCH_KERNEL_OUTER(...)                    \
-  switch (group_size) {                             \
-    case 16:                                        \
-      LAUNCH_KERNEL(16, __VA_ARGS__);               \
-      break;                                        \
-    case 32:                                        \
-      LAUNCH_KERNEL(32, __VA_ARGS__);               \
-      break;                                        \
-    case 64:                                        \
-      LAUNCH_KERNEL(64, __VA_ARGS__);               \
-      break;                                        \
-    case 128:                                       \
-      LAUNCH_KERNEL(128, __VA_ARGS__);              \
-      break;                                        \
-    default:                                        \
-      TORCH_CHECK(false, "Unsupported group_size"); \
-  }                                                 \
+#define LAUNCH_KERNEL_OUTER(...)                  \
+  switch (group_size) {                           \
+    case 16:                                      \
+      LAUNCH_KERNEL(16, __VA_ARGS__);             \
+      break;                                      \
+    case 32:                                      \
+      LAUNCH_KERNEL(32, __VA_ARGS__);             \
+      break;                                      \
+    case 64:                                      \
+      LAUNCH_KERNEL(64, __VA_ARGS__);             \
+      break;                                      \
+    case 128:                                     \
+      LAUNCH_KERNEL(128, __VA_ARGS__);            \
+      break;                                      \
+    default:                                      \
+      SGL_CHECK(false, "Unsupported group_size"); \
+  }                                               \
   while (0)
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
-    if (dst_type == at::ScalarType::Char) {
+  SGL_DISPATCH_FLOAT_FP16(input.scalar_type(), "sgl_per_token_group_quant_8bit_v2", [&] {
+    if (dst_type == ScalarType::Char) {
       LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
       return true;
-    } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
-      LAUNCH_KERNEL_OUTER(scalar_t, c10::Float8_e4m3fn);
+    } else if (dst_type == ScalarType::Float8_e4m3fn) {
+      LAUNCH_KERNEL_OUTER(scalar_t, torch::headeronly::Float8_e4m3fn);
       return true;
     }
     return false;
@@ -540,3 +676,21 @@ void sgl_per_token_group_quant_8bit_v2(
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INNER
 }
+
+#undef SGL_CHECK
+#undef SGL_CHECK_NO_MSG
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_GET_ENV_ENABLE_PDL
+#undef SGL_INPUT_PTR
+#undef SGL_OUTPUT_Q_PTR
+#undef SGL_OUTPUT_S_PTR
+#undef SGL_MASKED_M_PTR
+#undef SGL_OPTIONAL_TENSOR_ARG
+#undef SGL_DISPATCH_FLOAT_FP16
+#ifdef TORCH_TARGET_VERSION
+#undef CHECK_CUDA
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+#undef CHECK_EQ
+#undef SGL_DISPATCH_CASE_BF16
+#endif

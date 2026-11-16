@@ -1,6 +1,6 @@
-#include <c10/cuda/CUDAGuard.h>
 #include <cudaTypedefs.h>
-#include <torch/all.h>
+
+#include "moe/moe_ops.h"
 
 int32_t get_sm_version_num() {
   int32_t major_capability, minor_capability;
@@ -11,43 +11,43 @@ int32_t get_sm_version_num() {
 }
 
 void cutlass_w4a8_moe_mm_sm90(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    const SglTensor& a_tensors,
+    const SglTensor& b_tensors,
+    const SglTensor& a_scales,
+    const SglTensor& b_scales,
+    const SglTensor& expert_offsets,
+    const SglTensor& problem_sizes,
+    const SglTensor& a_strides,
+    const SglTensor& b_strides,
+    const SglTensor& d_strides,
+    const SglTensor& s_strides,
     int64_t chunk_size,
     int64_t topk);
 
 void get_cutlass_w4a8_moe_mm_data_caller(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
+    const SglTensor& topk_ids,
+    SglTensor& expert_offsets,
+    SglTensor& problem_sizes1,
+    SglTensor& problem_sizes2,
+    SglTensor& input_permutation,
+    SglTensor& output_permutation,
     const int64_t num_experts,
     const int64_t n,
     const int64_t k);
 
 void cutlass_w4a8_moe_mm(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    const SglTensor& a_tensors,
+    const SglTensor& b_tensors,
+    const SglTensor& a_scales,
+    const SglTensor& b_scales,
+    const SglTensor& expert_offsets,
+    const SglTensor& problem_sizes,
+    const SglTensor& a_strides,
+    const SglTensor& b_strides,
+    const SglTensor& d_strides,
+    const SglTensor& s_strides,
     int64_t chunk_size,
     int64_t topk) {
   cutlass_w4a8_moe_mm_sm90(
@@ -68,12 +68,12 @@ void cutlass_w4a8_moe_mm(
 }
 
 void get_cutlass_w4a8_moe_mm_data(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
+    const SglTensor& topk_ids,
+    SglTensor& expert_offsets,
+    SglTensor& problem_sizes1,
+    SglTensor& problem_sizes2,
+    SglTensor& input_permutation,
+    SglTensor& output_permutation,
     const int64_t num_experts,
     const int64_t n,
     const int64_t k) {

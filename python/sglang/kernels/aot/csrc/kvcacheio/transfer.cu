@@ -1,34 +1,148 @@
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
+#include <cuda.h>
+#endif
+#include <cuda_runtime.h>
+
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <vector>
+
+#include "kvcacheio/transfer.h"
+
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/device.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/csrc/stable/ops.h>
+
+#include "sgl_kernel_cuda_stream.h"
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/util/irange.h>
-#include <cuda_runtime.h>
-
-#include <cstdint>
-#include <limits>
-#include <vector>
+#endif
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
 #include <dlfcn.h>
 #define WARP_SIZE 32
+#ifndef TORCH_TARGET_VERSION
 #include "pytorch_extension_utils.h"
+#endif
 #else
 #include "pytorch_extension_utils_rocm.h"
 #include "utils.h"  // WARP_SIZE
 #endif
 
-inline void* resolve_device_accessible_ptr(const at::Tensor& tensor) {
-  void* ptr = tensor.data_ptr();
+using Tensor = SglTensor;
+#ifdef TORCH_TARGET_VERSION
+using SglDeviceType = torch::headeronly::DeviceType;
+#else
+using SglDeviceType = c10::DeviceType;
+#endif
+
+#ifdef TORCH_TARGET_VERSION
+#define SGL_CUDA_CHECK STD_CUDA_CHECK
+#define SGL_CUDA_KERNEL_LAUNCH_CHECK STD_CUDA_KERNEL_LAUNCH_CHECK
+#define SGL_CONST_TYPED_DATA_PTR(tensor, type) (tensor).const_data_ptr<type>()
+
+namespace {
+
+Tensor ToCpu(const Tensor& tensor) {
+  return torch::stable::to(tensor, torch::stable::Device(torch::headeronly::DeviceType::CPU));
+}
+
+Tensor Select(const Tensor& tensor, int64_t dim, int64_t index) {
+  return torch::stable::select(tensor, dim, index);
+}
+
+Tensor Slice(const Tensor& tensor, int64_t dim, int64_t start, int64_t end) {
+  std::array<StableIValue, 5> stack{
+      torch::stable::detail::from(tensor),
+      torch::stable::detail::from(dim),
+      torch::stable::detail::from(std::optional<int64_t>(start)),
+      torch::stable::detail::from(std::optional<int64_t>(end)),
+      torch::stable::detail::from(int64_t{1})};
+  TORCH_ERROR_CODE_CHECK(torch_call_dispatcher("aten::slice", "Tensor", stack.data(), TORCH_ABI_VERSION));
+  return torch::stable::detail::to<Tensor>(stack[0]);
+}
+
+void Copy(Tensor& dst, const Tensor& src) {
+  torch::stable::copy_(dst, src, true);
+}
+
+class CopyDeviceGuard {
+ public:
+  explicit CopyDeviceGuard(const Tensor& tensor) : guard_(tensor.get_device_index()) {}
+
+ private:
+  torch::stable::accelerator::DeviceGuard guard_;
+};
+
+int32_t CurrentDeviceIndex() {
+  return torch::stable::accelerator::getCurrentDeviceIndex();
+}
+
+cudaStream_t CurrentStream() {
+  return sgl_kernel::stable::get_current_cuda_stream();
+}
+
+}  // namespace
+#else
+#define SGL_CUDA_CHECK C10_CUDA_CHECK
+#define SGL_CUDA_KERNEL_LAUNCH_CHECK C10_CUDA_KERNEL_LAUNCH_CHECK
+#define SGL_CONST_TYPED_DATA_PTR(tensor, type) (tensor).data_ptr<type>()
+
+namespace {
+
+Tensor ToCpu(const Tensor& tensor) {
+  return tensor.cpu();
+}
+
+Tensor Select(const Tensor& tensor, int64_t dim, int64_t index) {
+  return tensor.select(dim, index);
+}
+
+Tensor Slice(const Tensor& tensor, int64_t dim, int64_t start, int64_t end) {
+  return tensor.slice(dim, start, end);
+}
+
+void Copy(Tensor& dst, const Tensor& src) {
+  dst.copy_(src, /* non_blocking= */ true);
+}
+
+class CopyDeviceGuard {
+ public:
+  explicit CopyDeviceGuard(const Tensor& tensor) : guard_(tensor.device()) {}
+
+ private:
+  at::cuda::OptionalCUDAGuard guard_;
+};
+
+int32_t CurrentDeviceIndex() {
+  return at::cuda::current_device();
+}
+
+cudaStream_t CurrentStream() {
+  return at::cuda::getCurrentCUDAStream();
+}
+
+}  // namespace
+#endif
+
+inline void* resolve_device_accessible_ptr(const Tensor& tensor) {
+  void* ptr = SGL_MUTABLE_DATA_PTR(tensor);
 #if defined(USE_ROCM)
-  if (tensor.device().is_cpu()) {
+  if (tensor.device().type() == SglDeviceType::CPU) {
     void* device_ptr = nullptr;
-    C10_CUDA_CHECK(hipHostGetDevicePointer(&device_ptr, ptr, 0));
+    SGL_CUDA_CHECK(hipHostGetDevicePointer(&device_ptr, ptr, 0));
     return device_ptr;
   }
 #elif !defined(USE_MUSA)
-  if (tensor.device().is_cpu()) {
+  if (tensor.device().type() == SglDeviceType::CPU) {
     void* device_ptr = nullptr;
-    C10_CUDA_CHECK(cudaHostGetDevicePointer(&device_ptr, ptr, 0));
+    SGL_CUDA_CHECK(cudaHostGetDevicePointer(&device_ptr, ptr, 0));
     return device_ptr;
   }
 #endif
@@ -36,14 +150,19 @@ inline void* resolve_device_accessible_ptr(const at::Tensor& tensor) {
 }
 
 #if !defined(USE_MUSA)
-int64_t get_device_accessible_ptr(const at::Tensor& tensor, int64_t device_index) {
-  TORCH_CHECK(device_index >= 0, "Target device index must be non-negative");
+int64_t get_device_accessible_ptr(const Tensor& tensor, int64_t device_index) {
+  SGL_TORCH_CHECK(device_index >= 0, "Target device index must be non-negative");
+#ifdef TORCH_TARGET_VERSION
+  const torch::stable::Device target_device(torch::headeronly::DeviceType::CUDA, device_index);
+  const torch::stable::accelerator::DeviceGuard device_guard(target_device.index());
+#else
   const c10::Device target_device(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(device_index));
   const at::cuda::OptionalCUDAGuard device_guard(target_device);
+#endif
   if (tensor.is_cuda()) {
-    TORCH_CHECK(tensor.device() == target_device, "GPU tensor must be on the target device");
+    SGL_TORCH_CHECK(tensor.device() == target_device, "GPU tensor must be on the target device");
   } else {
-    TORCH_CHECK(tensor.device().is_cpu(), "Only CPU and target-device tensors are supported");
+    SGL_TORCH_CHECK(tensor.device().type() == SglDeviceType::CPU, "Only CPU and target-device tensors are supported");
   }
   return reinterpret_cast<int64_t>(resolve_device_accessible_ptr(tensor));
 }
@@ -341,34 +460,35 @@ __global__ void transfer_kernel_impl(
 
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
-    const at::Tensor& src_k,
-    at::Tensor& dst_k,
-    const at::Tensor& src_v,
-    at::Tensor& dst_v,
-    const at::Tensor& src_indices,
-    const at::Tensor& dst_indices,
+    const Tensor& src_k,
+    Tensor& dst_k,
+    const Tensor& src_v,
+    Tensor& dst_v,
+    const Tensor& src_indices,
+    const Tensor& dst_indices,
     int64_t start_layer_id,
     int64_t num_layers_to_process,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
-    const at::Tensor& src_k_layers,
-    const at::Tensor& dst_k_layers,
-    const at::Tensor& src_v_layers,
-    const at::Tensor& dst_v_layers,
+    const Tensor& src_k_layers,
+    const Tensor& dst_k_layers,
+    const Tensor& src_v_layers,
+    const Tensor& dst_v_layers,
     int64_t block_quota,
     int64_t num_warps_per_block,
     const int64_t page_size = 16,
     const int64_t head_num = 1) {
-  TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
-  TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
-  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
-  TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
+  SGL_TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
+  SGL_TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
+  SGL_TORCH_CHECK(src_indices.scalar_type() == SglScalarType::Long, "Source indices must be of type long");
+  SGL_TORCH_CHECK(dst_indices.scalar_type() == SglScalarType::Long, "Destination indices must be of type long");
+  SGL_TORCH_CHECK(
+      src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  SGL_TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
 
 #if !defined(USE_MUSA)
-  const at::cuda::OptionalCUDAGuard device_guard(src_indices.device());
+  const CopyDeviceGuard device_guard(src_indices);
 #endif
 
   auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
@@ -382,20 +502,22 @@ void transfer_kv_launcher(
   void* dst_k_ptr = dst_k.defined() ? resolve_device_accessible_ptr(dst_k) : nullptr;
   const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : resolve_device_accessible_ptr(src_v);
   void* dst_v_ptr = IsMLA || !dst_v.defined() ? nullptr : resolve_device_accessible_ptr(dst_v);
-  const uintptr_t* src_k_tbl_ptr = src_k_layers.defined() ? src_k_layers.data_ptr<uintptr_t>() : nullptr;
-  const uintptr_t* dst_k_tbl_ptr = dst_k_layers.defined() ? dst_k_layers.data_ptr<uintptr_t>() : nullptr;
-  const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();
-  const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
+  const uintptr_t* src_k_tbl_ptr = src_k_layers.defined() ? SGL_CONST_TYPED_DATA_PTR(src_k_layers, uintptr_t) : nullptr;
+  const uintptr_t* dst_k_tbl_ptr = dst_k_layers.defined() ? SGL_CONST_TYPED_DATA_PTR(dst_k_layers, uintptr_t) : nullptr;
+  const uintptr_t* src_v_tbl_ptr =
+      IsMLA || !src_v_layers.defined() ? nullptr : SGL_CONST_TYPED_DATA_PTR(src_v_layers, uintptr_t);
+  const uintptr_t* dst_v_tbl_ptr =
+      IsMLA || !dst_v_layers.defined() ? nullptr : SGL_CONST_TYPED_DATA_PTR(dst_v_layers, uintptr_t);
 
-  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = CurrentStream();
   if constexpr (PageHeadLayout) {
     transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
         src_k_ptr,
         dst_k_ptr,
         src_v_ptr,
         dst_v_ptr,
-        src_indices.data_ptr<int64_t>(),
-        dst_indices.data_ptr<int64_t>(),
+        SGL_CONST_TYPED_DATA_PTR(src_indices, int64_t),
+        SGL_CONST_TYPED_DATA_PTR(dst_indices, int64_t),
         start_layer_id,
         num_layers_to_process,
         num_items,
@@ -415,8 +537,8 @@ void transfer_kv_launcher(
         dst_k_ptr,
         src_v_ptr,
         dst_v_ptr,
-        src_indices.data_ptr<int64_t>(),
-        dst_indices.data_ptr<int64_t>(),
+        SGL_CONST_TYPED_DATA_PTR(src_indices, int64_t),
+        SGL_CONST_TYPED_DATA_PTR(dst_indices, int64_t),
         start_layer_id,
         num_layers_to_process,
         num_items,
@@ -429,20 +551,20 @@ void transfer_kv_launcher(
         src_v_tbl_ptr,
         dst_v_tbl_ptr);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  SGL_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void transfer_kv_per_layer(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k,
+    Tensor dst_k,
+    const Tensor src_v,
+    Tensor dst_v,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  at::Tensor empty;
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_lf<char>, false>(
       src_k,
       dst_k,
@@ -464,18 +586,18 @@ void transfer_kv_per_layer(
 }
 
 void transfer_kv_per_layer_pf_lf(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k,
+    Tensor dst_k,
+    const Tensor src_v,
+    Tensor dst_v,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  at::Tensor empty;
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_pf<const char>, get_global_offset_lf<char>, false>(
       src_k,
       dst_k,
@@ -497,12 +619,12 @@ void transfer_kv_per_layer_pf_lf(
 }
 
 void transfer_kv_per_layer_ph_lf(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k,
+    Tensor dst_k,
+    const Tensor src_v,
+    Tensor dst_v,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
@@ -510,7 +632,7 @@ void transfer_kv_per_layer_ph_lf(
     int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  at::Tensor empty;
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_ph<const char>, get_global_offset_per_head_lf<char>, false, true>(
       src_k,
       dst_k,
@@ -534,18 +656,18 @@ void transfer_kv_per_layer_ph_lf(
 }
 
 void transfer_kv_all_layer(
-    const at::Tensor src_k_layers,
-    const at::Tensor dst_k_layers,
-    const at::Tensor src_v_layers,
-    const at::Tensor dst_v_layers,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k_layers,
+    const Tensor dst_k_layers,
+    const Tensor src_v_layers,
+    const Tensor dst_v_layers,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
-  at::Tensor empty;
+  SGL_TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, false>(
       empty,
       empty,
@@ -567,19 +689,19 @@ void transfer_kv_all_layer(
 }
 
 void transfer_kv_all_layer_lf_pf(
-    const at::Tensor src_k_layers,
-    at::Tensor dst_k,
-    const at::Tensor src_v_layers,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k_layers,
+    Tensor dst_k,
+    const Tensor src_v_layers,
+    Tensor dst_v,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
-  at::Tensor empty;
+  SGL_TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, false>(
       empty,
       dst_k,
@@ -601,12 +723,12 @@ void transfer_kv_all_layer_lf_pf(
 }
 
 void transfer_kv_all_layer_lf_ph(
-    const at::Tensor src_k_layers,
-    at::Tensor dst_k,
-    const at::Tensor src_v_layers,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_k_layers,
+    Tensor dst_k,
+    const Tensor src_v_layers,
+    Tensor dst_v,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t dst_layout_dim,
     int64_t num_layers,
@@ -614,8 +736,8 @@ void transfer_kv_all_layer_lf_ph(
     int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
-  at::Tensor empty;
+  SGL_TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_ph<char>, false, true>(
       empty,
       dst_k,
@@ -639,14 +761,14 @@ void transfer_kv_all_layer_lf_ph(
 }
 
 void transfer_kv_per_layer_mla(
-    const at::Tensor src,
-    at::Tensor dst,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src,
+    Tensor dst,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  at::Tensor empty;
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_lf<char>, true>(
       src,
       dst,
@@ -668,16 +790,16 @@ void transfer_kv_per_layer_mla(
 }
 
 void transfer_kv_per_layer_mla_pf_lf(
-    const at::Tensor src,
-    at::Tensor dst,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src,
+    Tensor dst,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  at::Tensor empty;
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_pf<const char>, get_global_offset_lf<char>, true>(
       src,
       dst,
@@ -699,16 +821,16 @@ void transfer_kv_per_layer_mla_pf_lf(
 }
 
 void transfer_kv_all_layer_mla(
-    const at::Tensor src_layers,
-    const at::Tensor dst_layers,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_layers,
+    const Tensor dst_layers,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
-  at::Tensor empty;
+  SGL_TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, true>(
       empty,
       empty,
@@ -730,17 +852,17 @@ void transfer_kv_all_layer_mla(
 }
 
 void transfer_kv_all_layer_mla_lf_pf(
-    const at::Tensor src_layers,
-    at::Tensor dst,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const Tensor src_layers,
+    Tensor dst,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t item_size,
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
-  at::Tensor empty;
+  SGL_TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
+  Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, true>(
       empty,
       dst,
@@ -762,36 +884,32 @@ void transfer_kv_all_layer_mla_lf_pf(
 }
 
 inline void transfer_page_direct(
-    const at::Tensor src_buffer,
-    at::Tensor dst_buffer,
-    int64_t src_page_index,
-    int64_t dst_page_index,
-    int64_t page_size) {
-  dst_buffer.slice(0, dst_page_index, dst_page_index + page_size)
-      .copy_(
-          src_buffer.slice(0, src_page_index, src_page_index + page_size),
-          /* non_blocking= */ true);
+    const Tensor src_buffer, Tensor dst_buffer, int64_t src_page_index, int64_t dst_page_index, int64_t page_size) {
+  auto dst_slice = Slice(dst_buffer, 0, dst_page_index, dst_page_index + page_size);
+  auto src_slice = Slice(src_buffer, 0, src_page_index, src_page_index + page_size);
+  Copy(dst_slice, src_slice);
 }
 
 void transfer_kv_direct(
-    const std::vector<at::Tensor>& src_layers,
-    std::vector<at::Tensor> dst_layers,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
+    const std::vector<Tensor>& src_layers,
+    std::vector<Tensor> dst_layers,
+    const Tensor src_indices,
+    const Tensor dst_indices,
     int64_t page_size) {
-  TORCH_CHECK(
+  SGL_TORCH_CHECK(
       src_layers.size() == dst_layers.size(), "Source and destination layers must have the same number of layers");
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
-  TORCH_CHECK(page_size > 0, "Page size must be positive");
-  TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
+  SGL_TORCH_CHECK(
+      src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  SGL_TORCH_CHECK(page_size > 0, "Page size must be positive");
+  SGL_TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
 
-  auto src_indices_cpu = src_indices.cpu();
-  auto dst_indices_cpu = dst_indices.cpu();
+  auto src_indices_cpu = ToCpu(src_indices);
+  auto dst_indices_cpu = ToCpu(dst_indices);
 
   const auto num_indices = src_indices_cpu.numel();
   const int64_t num_layers = src_layers.size();
-  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
-  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+  const int64_t* src_indices_ptr = SGL_CONST_TYPED_DATA_PTR(src_indices_cpu, int64_t);
+  const int64_t* dst_indices_ptr = SGL_CONST_TYPED_DATA_PTR(dst_indices_cpu, int64_t);
 
   int64_t start_index = 0;
   int64_t end_index = 0;
@@ -820,19 +938,19 @@ void transfer_kv_direct(
 }
 
 void transfer_embedding_ranges_direct(
-    const at::Tensor& src,
-    at::Tensor& dst,
+    const Tensor& src,
+    Tensor& dst,
     const std::vector<int64_t>& src_starts,
     const std::vector<int64_t>& dst_starts,
     const std::vector<int64_t>& lengths) {
-  TORCH_CHECK(src.dim() == 2, "Source embedding tensor must be 2D");
-  TORCH_CHECK(dst.dim() == 2, "Destination embedding tensor must be 2D");
-  TORCH_CHECK(src.scalar_type() == dst.scalar_type(), "Source and destination dtypes must match");
-  TORCH_CHECK(src.size(1) == dst.size(1), "Source and destination embedding dims must match");
-  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "Embedding tensors must be contiguous");
-  TORCH_CHECK(src.is_cuda() != dst.is_cuda(), "Exactly one embedding tensor must be on CUDA");
-  TORCH_CHECK(src_starts.size() == dst_starts.size(), "src_starts and dst_starts must have the same length");
-  TORCH_CHECK(src_starts.size() == lengths.size(), "src_starts and lengths must have the same length");
+  SGL_TORCH_CHECK(src.dim() == 2, "Source embedding tensor must be 2D");
+  SGL_TORCH_CHECK(dst.dim() == 2, "Destination embedding tensor must be 2D");
+  SGL_TORCH_CHECK(src.scalar_type() == dst.scalar_type(), "Source and destination dtypes must match");
+  SGL_TORCH_CHECK(src.size(1) == dst.size(1), "Source and destination embedding dims must match");
+  SGL_TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "Embedding tensors must be contiguous");
+  SGL_TORCH_CHECK(src.is_cuda() != dst.is_cuda(), "Exactly one embedding tensor must be on CUDA");
+  SGL_TORCH_CHECK(src_starts.size() == dst_starts.size(), "src_starts and dst_starts must have the same length");
+  SGL_TORCH_CHECK(src_starts.size() == lengths.size(), "src_starts and lengths must have the same length");
 
   const auto num_ranges = lengths.size();
   if (num_ranges == 0) {
@@ -840,12 +958,13 @@ void transfer_embedding_ranges_direct(
   }
 
   const auto copy_device = src.is_cuda() ? src.device() : dst.device();
-  const at::cuda::OptionalCUDAGuard device_guard(copy_device);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const Tensor& copy_tensor = src.is_cuda() ? src : dst;
+  const CopyDeviceGuard device_guard(copy_tensor);
+  const cudaStream_t stream = CurrentStream();
 
   const size_t row_bytes = static_cast<size_t>(src.size(1)) * src.element_size();
-  const char* src_base = static_cast<const char*>(src.data_ptr());
-  char* dst_base = static_cast<char*>(dst.data_ptr());
+  const char* src_base = static_cast<const char*>(SGL_CONST_DATA_PTR(src));
+  char* dst_base = static_cast<char*>(SGL_MUTABLE_DATA_PTR(dst));
 
   thread_local std::vector<void*> batch_srcs;
   thread_local std::vector<void*> batch_dsts;
@@ -864,14 +983,14 @@ void transfer_embedding_ranges_direct(
     const int64_t dst_start = dst_starts[i];
     const int64_t length = lengths[i];
 
-    TORCH_CHECK(length >= 0, "Range length must be non-negative");
+    SGL_TORCH_CHECK(length >= 0, "Range length must be non-negative");
     if (length == 0) {
       continue;
     }
-    TORCH_CHECK(src_start >= 0, "Source range start must be non-negative");
-    TORCH_CHECK(dst_start >= 0, "Destination range start must be non-negative");
-    TORCH_CHECK(length <= src.size(0) - src_start, "Source range is out of bounds");
-    TORCH_CHECK(length <= dst.size(0) - dst_start, "Destination range is out of bounds");
+    SGL_TORCH_CHECK(src_start >= 0, "Source range start must be non-negative");
+    SGL_TORCH_CHECK(dst_start >= 0, "Destination range start must be non-negative");
+    SGL_TORCH_CHECK(length <= src.size(0) - src_start, "Source range is out of bounds");
+    SGL_TORCH_CHECK(length <= dst.size(0) - dst_start, "Destination range is out of bounds");
 
     batch_srcs.push_back(const_cast<char*>(src_base + static_cast<size_t>(src_start) * row_bytes));
     batch_dsts.push_back(dst_base + static_cast<size_t>(dst_start) * row_bytes);
@@ -880,7 +999,7 @@ void transfer_embedding_ranges_direct(
 
   const auto fallback_to_async_copies = [&]() {
     for (size_t i = 0; i < batch_sizes.size(); ++i) {
-      C10_CUDA_CHECK(cudaMemcpyAsync(batch_dsts[i], batch_srcs[i], batch_sizes[i], cudaMemcpyDefault, stream));
+      SGL_CUDA_CHECK(cudaMemcpyAsync(batch_dsts[i], batch_srcs[i], batch_sizes[i], cudaMemcpyDefault, stream));
     }
   };
 
@@ -965,43 +1084,44 @@ void transfer_embedding_ranges_direct(
     fallback_to_async_copies();
     return;
   }
-  TORCH_CHECK(
+  SGL_TORCH_CHECK(
       err == cudaSuccess, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
 #endif
 }
 
 template <bool IsLf2Pf>
 inline void transfer_kv_page_first_direct_impl(
-    const std::vector<at::Tensor>& src_ptrs,
-    std::vector<at::Tensor> dst_ptrs,
-    const at::Tensor& src_indices,
-    const at::Tensor& dst_indices,
+    const std::vector<Tensor>& src_ptrs,
+    std::vector<Tensor> dst_ptrs,
+    const Tensor& src_indices,
+    const Tensor& dst_indices,
     int64_t start_layer_id,
     int64_t page_size) {
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
-  TORCH_CHECK(page_size > 0, "Page size must be positive");
-  TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
+  SGL_TORCH_CHECK(
+      src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  SGL_TORCH_CHECK(page_size > 0, "Page size must be positive");
+  SGL_TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
 
-  auto src_indices_cpu = src_indices.cpu();
-  auto dst_indices_cpu = dst_indices.cpu();
+  auto src_indices_cpu = ToCpu(src_indices);
+  auto dst_indices_cpu = ToCpu(dst_indices);
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
-  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
-  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+  const int64_t* src_indices_ptr = SGL_CONST_TYPED_DATA_PTR(src_indices_cpu, int64_t);
+  const int64_t* dst_indices_ptr = SGL_CONST_TYPED_DATA_PTR(dst_indices_cpu, int64_t);
 
   auto fallback_to_page_copy = [&]() {
     if constexpr (IsLf2Pf) {
       const bool is_mla = dst_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
-      for (const auto i : c10::irange(num_pages)) {
+      for (int64_t i = 0; i < num_pages; ++i) {
         const int64_t s_index = src_indices_ptr[i * page_size];
         const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
         for (int64_t j = 0; j < num_layers; ++j) {
           transfer_page_direct(
-              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+              src_ptrs[j], Select(Select(dst_ptrs[0], 0, d_index), 0, start_layer_id + j), s_index, 0, page_size);
           if (!is_mla) {
             transfer_page_direct(
                 src_ptrs[j + num_layers],
-                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                Select(Select(dst_ptrs[1], 0, d_index), 0, start_layer_id + j),
                 s_index,
                 0,
                 page_size);
@@ -1011,15 +1131,15 @@ inline void transfer_kv_page_first_direct_impl(
     } else {
       const bool is_mla = src_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
-      for (const auto i : c10::irange(num_pages)) {
+      for (int64_t i = 0; i < num_pages; ++i) {
         const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
         const int64_t d_index = dst_indices_ptr[i * page_size];
         for (int64_t j = 0; j < num_layers; ++j) {
           transfer_page_direct(
-              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+              Select(Select(src_ptrs[0], 0, s_index), 0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
           if (!is_mla) {
             transfer_page_direct(
-                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+                Select(Select(src_ptrs[1], 0, s_index), 0, start_layer_id + j),
                 dst_ptrs[j + num_layers],
                 0,
                 d_index,
@@ -1038,25 +1158,25 @@ inline void transfer_kv_page_first_direct_impl(
   if (kEnableHipBatch) {
     std::vector<void*> b_srcs, b_dsts;
     std::vector<size_t> b_sizes;
-    auto batch_append = [&](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
+    auto batch_append = [&](const Tensor& s, const Tensor& d, int64_t si, int64_t di, int64_t ps) {
       const int64_t esz = s.element_size();
-      b_srcs.push_back(static_cast<char*>(s.data_ptr()) + si * s.stride(0) * esz);
-      b_dsts.push_back(static_cast<char*>(d.data_ptr()) + di * d.stride(0) * esz);
+      b_srcs.push_back(const_cast<char*>(static_cast<const char*>(SGL_CONST_DATA_PTR(s))) + si * s.stride(0) * esz);
+      b_dsts.push_back(static_cast<char*>(SGL_MUTABLE_DATA_PTR(d)) + di * d.stride(0) * esz);
       b_sizes.push_back(static_cast<size_t>(ps) * static_cast<size_t>(s.stride(0)) * static_cast<size_t>(esz));
     };
     if constexpr (IsLf2Pf) {
       const bool is_mla = dst_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
-      for (const auto i : c10::irange(num_pages)) {
+      for (int64_t i = 0; i < num_pages; ++i) {
         const int64_t s_index = src_indices_ptr[i * page_size];
         const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
         for (int64_t j = 0; j < num_layers; ++j) {
           batch_append(
-              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+              src_ptrs[j], Select(Select(dst_ptrs[0], 0, d_index), 0, start_layer_id + j), s_index, 0, page_size);
           if (!is_mla) {
             batch_append(
                 src_ptrs[j + num_layers],
-                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                Select(Select(dst_ptrs[1], 0, d_index), 0, start_layer_id + j),
                 s_index,
                 0,
                 page_size);
@@ -1066,15 +1186,15 @@ inline void transfer_kv_page_first_direct_impl(
     } else {
       const bool is_mla = src_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
-      for (const auto i : c10::irange(num_pages)) {
+      for (int64_t i = 0; i < num_pages; ++i) {
         const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
         const int64_t d_index = dst_indices_ptr[i * page_size];
         for (int64_t j = 0; j < num_layers; ++j) {
           batch_append(
-              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+              Select(Select(src_ptrs[0], 0, s_index), 0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
           if (!is_mla) {
             batch_append(
-                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+                Select(Select(src_ptrs[1], 0, s_index), 0, start_layer_id + j),
                 dst_ptrs[j + num_layers],
                 0,
                 d_index,
@@ -1145,8 +1265,8 @@ inline void transfer_kv_page_first_direct_impl(
   std::vector<size_t> batch_sizes;
   std::vector<size_t> attrs_idxs(1, 0);
   cudaMemcpyAttributes attrs{};
-  const int device_id = at::cuda::current_device();
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int device_id = CurrentDeviceIndex();
+  const cudaStream_t stream = CurrentStream();
 
   auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
     batch_srcs.push_back(src);
@@ -1175,20 +1295,21 @@ inline void transfer_kv_page_first_direct_impl(
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
 
-    for (const auto i : c10::irange(num_pages)) {
+    for (int64_t i = 0; i < num_pages; ++i) {
       auto s_index = src_indices_ptr[i * page_size];
       auto d_index = dst_indices_ptr[i * page_size] / page_size;
 
       for (int64_t j = 0; j < num_layers; ++j) {
-        const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
-        char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
+        const char* src_k_ptr =
+            static_cast<const char*>(SGL_CONST_DATA_PTR(src_ptrs[j])) + s_index * src_stride0 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(SGL_MUTABLE_DATA_PTR(dst_ptrs[0])) + d_index * dst_stride0 * elem_size +
                           (start_layer_id + j) * dst_stride1 * elem_size;
         append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
 
         if (!is_mla) {
-          const char* src_v_ptr =
-              static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
-          char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
+          const char* src_v_ptr = static_cast<const char*>(SGL_CONST_DATA_PTR(src_ptrs[j + num_layers])) +
+                                  s_index * src_stride0 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(SGL_MUTABLE_DATA_PTR(dst_ptrs[1])) + d_index * dst_stride0 * elem_size +
                             (start_layer_id + j) * dst_stride1 * elem_size;
           append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
@@ -1216,27 +1337,28 @@ inline void transfer_kv_page_first_direct_impl(
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
 
-    for (const auto i : c10::irange(num_pages)) {
+    for (int64_t i = 0; i < num_pages; ++i) {
       auto s_index = src_indices_ptr[i * page_size] / page_size;
       auto d_index = dst_indices_ptr[i * page_size];
 
       for (int64_t j = 0; j < num_layers; ++j) {
-        const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
-                                (start_layer_id + j) * src_stride1 * elem_size;
-        char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        const char* src_k_ptr = static_cast<const char*>(SGL_CONST_DATA_PTR(src_ptrs[0])) +
+                                s_index * src_stride0 * elem_size + (start_layer_id + j) * src_stride1 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(SGL_MUTABLE_DATA_PTR(dst_ptrs[j])) + d_index * dst_stride0 * elem_size;
         append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
 
         if (!is_mla) {
-          const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
-                                  (start_layer_id + j) * src_stride1 * elem_size;
-          char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          const char* src_v_ptr = static_cast<const char*>(SGL_CONST_DATA_PTR(src_ptrs[1])) +
+                                  s_index * src_stride0 * elem_size + (start_layer_id + j) * src_stride1 * elem_size;
+          char* dst_v_ptr =
+              static_cast<char*>(SGL_MUTABLE_DATA_PTR(dst_ptrs[j + num_layers])) + d_index * dst_stride0 * elem_size;
           append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
   }
 
-  TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
+  SGL_TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
     cudaError_t err;
     size_t fail_idx = std::numeric_limits<size_t>::max();
@@ -1273,27 +1395,31 @@ inline void transfer_kv_page_first_direct_impl(
       return;
     }
     if (err != cudaSuccess) {
-      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+      SGL_TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
     }
   }
 #endif
 }
 
 void transfer_kv_per_layer_direct_pf_lf(
-    const std::vector<at::Tensor>& src_ptrs,
-    std::vector<at::Tensor> dst_ptrs,
-    const at::Tensor& src_indices,
-    const at::Tensor& dst_indices,
+    const std::vector<Tensor>& src_ptrs,
+    std::vector<Tensor> dst_ptrs,
+    const Tensor& src_indices,
+    const Tensor& dst_indices,
     int64_t layer_id,
     int64_t page_size) {
   transfer_kv_page_first_direct_impl<false>(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size);
 }
 
 void transfer_kv_all_layer_direct_lf_pf(
-    const std::vector<at::Tensor>& src_ptrs,
-    std::vector<at::Tensor> dst_ptrs,
-    const at::Tensor& src_indices,
-    const at::Tensor& dst_indices,
+    const std::vector<Tensor>& src_ptrs,
+    std::vector<Tensor> dst_ptrs,
+    const Tensor& src_indices,
+    const Tensor& dst_indices,
     int64_t page_size) {
   transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
 }
+
+#undef SGL_CONST_TYPED_DATA_PTR
+#undef SGL_CUDA_KERNEL_LAUNCH_CHECK
+#undef SGL_CUDA_CHECK

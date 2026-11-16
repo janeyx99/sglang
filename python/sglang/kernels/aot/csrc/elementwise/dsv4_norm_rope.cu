@@ -28,13 +28,51 @@ limitations under the License.
 #include <hip/hip_runtime.h>
 #endif
 
+#include <cstdint>
+
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include "elementwise/elementwise_ops.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+using BFloat16 = torch::headeronly::BFloat16;
+
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM(tensor) sgl_kernel::stable::get_current_cuda_stream(tensor.get_device_index())
+#define ELEM_CONST_DATA_PTR(tensor, type) tensor.const_data_ptr<type>()
+#define ELEM_MUTABLE_DATA_PTR(tensor, type) tensor.mutable_data_ptr<type>()
+#define SGL_CONST_LEGACY_UNTYPED_DATA_PTR(tensor, type) static_cast<const type*>(tensor.const_data_ptr())
+#define SGL_MUTABLE_LEGACY_UNTYPED_DATA_PTR(tensor, type) static_cast<type*>(tensor.mutable_data_ptr())
+#define SGL_MUTABLE_UNTYPED_DATA_PTR(tensor) tensor.mutable_data_ptr()
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define FULL_MASK 0xffffffffu
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
-#include <cstdint>
-
 #include "utils.h"
+
+using Tensor = at::Tensor;
+using ScalarType = at::ScalarType;
+using BFloat16 = c10::BFloat16;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CURRENT_CUDA_STREAM(tensor) at::cuda::getCurrentCUDAStream(tensor.get_device())
+#define ELEM_CONST_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define ELEM_MUTABLE_DATA_PTR(tensor, type) tensor.data_ptr<type>()
+#define SGL_CONST_LEGACY_UNTYPED_DATA_PTR(tensor, type) static_cast<const type*>(tensor.data_ptr())
+#define SGL_MUTABLE_LEGACY_UNTYPED_DATA_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_MUTABLE_UNTYPED_DATA_PTR(tensor) tensor.data_ptr()
+#endif
 
 // ============================================================================
 // Platform-compatible type aliases
@@ -285,38 +323,40 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
 // ============================================================================
 
 void dsv4_fused_q_indexer_rope_hadamard_quant(
-    const at::Tensor& q_input,
-    at::Tensor& q_fp8,
-    const at::Tensor& weight,
-    at::Tensor& weights_out,
+    const Tensor& q_input,
+    Tensor& q_fp8,
+    const Tensor& weight,
+    Tensor& weights_out,
     double weight_scale,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions) {
-  TORCH_CHECK(q_input.is_cuda(), "q_input must be a CUDA tensor");
-  TORCH_CHECK(q_input.scalar_type() == at::ScalarType::BFloat16, "q_input must be bfloat16");
-  TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: (B, H, D)");
+    const Tensor& freqs_cis,
+    const Tensor& positions) {
+  SGL_CHECK(q_input.is_cuda(), "q_input must be a CUDA tensor");
+  SGL_CHECK(q_input.scalar_type() == ScalarType::BFloat16, "q_input must be bfloat16");
+  SGL_CHECK(q_input.dim() == 3, "q_input must be 3D: (B, H, D)");
 
   const int64_t B = q_input.size(0);
   const int64_t H = q_input.size(1);
   constexpr int64_t kHeadDim = 128;
-  TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128 for indexer");
-  TORCH_CHECK(
-      q_input.stride(2) == 1 && q_input.stride(1) == kHeadDim, "q_input must be contiguous in (head, elem) dims");
-  TORCH_CHECK(q_input.stride(0) == H * kHeadDim, "q_input must be contiguous (B, H, D)");
-  TORCH_CHECK(q_fp8.stride(0) == H * kHeadDim, "q_fp8 must be contiguous (B, H, D)");
-  TORCH_CHECK(positions.scalar_type() == at::ScalarType::Int, "positions must be int32");
+  SGL_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128 for indexer");
+  SGL_CHECK(q_input.stride(2) == 1 && q_input.stride(1) == kHeadDim, "q_input must be contiguous in (head, elem) dims");
+  SGL_CHECK(q_input.stride(0) == H * kHeadDim, "q_input must be contiguous (B, H, D)");
+  SGL_CHECK(q_fp8.stride(0) == H * kHeadDim, "q_fp8 must be contiguous (B, H, D)");
+  SGL_CHECK(positions.scalar_type() == ScalarType::Int, "positions must be int32");
 
   if (B == 0) return;
 
-  const auto stream = at::cuda::getCurrentCUDAStream(q_input.get_device());
+  const auto stream = SGL_CURRENT_CUDA_STREAM(q_input);
   const auto params = FusedQIndexerRopeHadamardQuantParams{
-      .q_input = q_input.data_ptr(),
-      .q_fp8 = q_fp8.data_ptr(),
-      .weight = weight.data_ptr(),
-      .weights_out = weights_out.data_ptr<float>(),
+      .q_input = SGL_CONST_LEGACY_UNTYPED_DATA_PTR(q_input, BFloat16),
+      // Existing callers use both Byte storage (the direct AOT test) and
+      // Float8_e4m3fn storage (the production wrapper), matching the legacy
+      // untyped data_ptr contract.
+      .q_fp8 = static_cast<uint8_t*>(SGL_MUTABLE_UNTYPED_DATA_PTR(q_fp8)),
+      .weight = SGL_CONST_LEGACY_UNTYPED_DATA_PTR(weight, BFloat16),
+      .weights_out = ELEM_MUTABLE_DATA_PTR(weights_out, float),
       .weight_scale = static_cast<float>(weight_scale),
-      .freqs_cis = freqs_cis.data_ptr<float>(),
-      .positions = positions.data_ptr<int32_t>(),
+      .freqs_cis = ELEM_CONST_DATA_PTR(freqs_cis, float),
+      .positions = ELEM_CONST_DATA_PTR(positions, int32_t),
       .batch_size = static_cast<uint32_t>(B),
       .num_heads = static_cast<uint32_t>(H),
   };
@@ -325,3 +365,17 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
 
   fused_q_indexer_rope_hadamard_quant_kernel<<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef CEILDIV
+#undef FULL_MASK
+#undef SGLANG_SHFL_XOR_SYNC
+#undef SGLANG_SHFL_XOR_SYNC_WIDTH
+#endif
+#undef SGL_CHECK
+#undef SGL_CURRENT_CUDA_STREAM
+#undef ELEM_CONST_DATA_PTR
+#undef ELEM_MUTABLE_DATA_PTR
+#undef SGL_CONST_LEGACY_UNTYPED_DATA_PTR
+#undef SGL_MUTABLE_LEGACY_UNTYPED_DATA_PTR
+#undef SGL_MUTABLE_UNTYPED_DATA_PTR

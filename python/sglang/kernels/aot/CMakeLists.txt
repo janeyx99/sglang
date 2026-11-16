@@ -44,7 +44,7 @@ elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
 endif()
 
 # Torch
-find_package(Torch REQUIRED)
+find_package(Torch 2.11 REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos
@@ -241,7 +241,6 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/merge_attn_states.cu"
-    "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
@@ -280,8 +279,21 @@ set(SOURCES
 
     "csrc/quantization/gguf/gguf_kernel.cu"
 
-    "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
+    "csrc/flashinfer/norm.cu"
+    "csrc/flashinfer/renorm.cu"
+    "csrc/registration/allreduce_ops.cc"
+    "csrc/registration/attention_ops.cc"
+    "csrc/registration/elementwise_ops.cc"
+    "csrc/registration/expert_specialization_ops.cc"
+    "csrc/registration/flashinfer_ops.cc"
+    "csrc/registration/gemm_ops.cc"
+    "csrc/registration/grammar_ops.cc"
+    "csrc/registration/infllm_v2_ops.cc"
+    "csrc/registration/kvcacheio_ops.cc"
+    "csrc/registration/mamba_ops.cc"
+    "csrc/registration/memory_ops.cc"
+    "csrc/registration/moe_ops.cc"
+    "csrc/registration/quantization_ops.cc"
 )
 
 set(INCLUDES
@@ -295,29 +307,31 @@ set(INCLUDES
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+Python_add_library(common_ops_stable_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+target_compile_definitions(common_ops_stable_sm90_build PRIVATE TORCH_TARGET_VERSION=0x020B000000000000ULL USE_CUDA)
 
-target_compile_options(common_ops_sm90_build PRIVATE
+target_compile_options(common_ops_stable_sm90_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
 )
-target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
+target_include_directories(common_ops_stable_sm90_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm90_build PROPERTIES
-    OUTPUT_NAME "common_ops"
+set_target_properties(common_ops_stable_sm90_build PROPERTIES
+    OUTPUT_NAME "common_ops_stable"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+Python_add_library(common_ops_stable_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+target_compile_definitions(common_ops_stable_sm100_build PRIVATE TORCH_TARGET_VERSION=0x020B000000000000ULL USE_CUDA)
 
-target_compile_options(common_ops_sm100_build PRIVATE
+target_compile_options(common_ops_stable_sm100_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
 )
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
+target_include_directories(common_ops_stable_sm100_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
+set_target_properties(common_ops_stable_sm100_build PROPERTIES
+    OUTPUT_NAME "common_ops_stable"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
 
@@ -337,14 +351,31 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops_stable_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops_stable_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
-install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+install(TARGETS common_ops_stable_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+install(TARGETS common_ops_stable_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+
+# apply_gguf_moe_weights uses ATen overlap validation with no stable 2.11 shim.
+# Keep it in the legacy companion until those checks can be preserved via stable APIs.
+foreach(arch IN ITEMS 90 100)
+    Python_add_library(common_ops_sm${arch}_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+        csrc/moe/moe_sum.cu csrc/registration/common_legacy_ops.cc)
+    target_compile_options(common_ops_sm${arch}_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+    if(arch STREQUAL "90")
+        target_compile_options(common_ops_sm${arch}_build PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
+    target_include_directories(common_ops_sm${arch}_build PRIVATE ${INCLUDES})
+    target_link_libraries(common_ops_sm${arch}_build PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    set_target_properties(common_ops_sm${arch}_build PROPERTIES
+        OUTPUT_NAME "common_ops" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm${arch}")
+    install(TARGETS common_ops_sm${arch}_build LIBRARY DESTINATION sgl_kernel/sm${arch})
+endforeach()
 
 # ===================== InfLLM-V2 FlashAttention backend ===================== #
 # Standalone pybind extension `infllm_ops`, vendored from

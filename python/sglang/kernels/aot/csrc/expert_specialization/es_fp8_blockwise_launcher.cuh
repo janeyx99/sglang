@@ -1,7 +1,9 @@
 #pragma once
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
+
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include <cassert>
 #include <iostream>
@@ -18,87 +20,98 @@ using namespace cute;
 template <typename T>
 void es_sm90_fp8_blockwise_scaled_group_mm_pre_compute(
     // Output
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    torch::Tensor& layout_sfa,
-    torch::Tensor& layout_sfb,
-    torch::Tensor& lm_problem_sizes,
-    torch::Tensor& mm_problem_sizes,
-    torch::Tensor& hm_problem_sizes,
+    torch::stable::Tensor& out_ptrs,
+    torch::stable::Tensor& a_ptrs,
+    torch::stable::Tensor& b_ptrs,
+    torch::stable::Tensor& a_scales_ptrs,
+    torch::stable::Tensor& b_scales_ptrs,
+    torch::stable::Tensor& layout_sfa,
+    torch::stable::Tensor& layout_sfb,
+    torch::stable::Tensor& lm_problem_sizes,
+    torch::stable::Tensor& mm_problem_sizes,
+    torch::stable::Tensor& hm_problem_sizes,
     // Input
-    torch::Tensor& out_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& expert_offsets,
+    torch::stable::Tensor& out_tensors,
+    torch::stable::Tensor const& a_tensors,
+    torch::stable::Tensor const& b_tensors,
+    torch::stable::Tensor const& a_scales,
+    torch::stable::Tensor const& b_scales,
+    torch::stable::Tensor const& problem_sizes,
+    torch::stable::Tensor const& expert_offsets,
     bool is_h20_device,
     cudaStream_t stream) {
-  TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(b_tensors.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
-  TORCH_CHECK(b_scales.dtype() == torch::kFloat32);
+  STD_TORCH_CHECK(a_tensors.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
+  STD_TORCH_CHECK(b_tensors.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn);
+  STD_TORCH_CHECK(a_scales.scalar_type() == torch::headeronly::ScalarType::Float);
+  STD_TORCH_CHECK(b_scales.scalar_type() == torch::headeronly::ScalarType::Float);
 
   // Creat Scale Factor Layout Functor
   using LayoutSFA = typename PerfConfigMiddleMH20::LayoutSFA;
   using LayoutSFB = typename PerfConfigMiddleMH20::LayoutSFB;
   struct Fp8BlockwiseGroupedGemmSFLayoutFunctor<PerfConfigMiddleMH20> sf_layout(
-      reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()), reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr()));
+      reinterpret_cast<LayoutSFA*>(layout_sfa.mutable_data_ptr()),
+      reinterpret_cast<LayoutSFB*>(layout_sfb.mutable_data_ptr()));
 
   int num_experts = (int)expert_offsets.size(0);
-  TORCH_CHECK(num_experts <= 1024, "Expert more than 1024");  // Max threads per block is 1024
+  STD_TORCH_CHECK(num_experts <= 1024, "Expert more than 1024");  // Max threads per block is 1024
 
   struct Fp8BlockwiseGroupedGemmOffsetFunctor<cutlass::float_e4m3_t, float, T> of(
-      static_cast<int*>(expert_offsets.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(b_tensors.data_ptr()),
-      static_cast<T*>(out_tensors.data_ptr()),
-      static_cast<float*>(a_scales.data_ptr()),
-      static_cast<float*>(b_scales.data_ptr()),
-      static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),
-      static_cast<cutlass::float_e4m3_t**>(b_ptrs.data_ptr()),
-      static_cast<float**>(a_scales_ptrs.data_ptr()),
-      static_cast<float**>(b_scales_ptrs.data_ptr()),
-      static_cast<T**>(out_ptrs.data_ptr()));
+      const_cast<int*>(static_cast<const int*>(expert_offsets.const_data_ptr())),
+      const_cast<cutlass::float_e4m3_t*>(static_cast<const cutlass::float_e4m3_t*>(a_tensors.const_data_ptr())),
+      const_cast<cutlass::float_e4m3_t*>(static_cast<const cutlass::float_e4m3_t*>(b_tensors.const_data_ptr())),
+      static_cast<T*>(out_tensors.mutable_data_ptr()),
+      const_cast<float*>(static_cast<const float*>(a_scales.const_data_ptr())),
+      const_cast<float*>(static_cast<const float*>(b_scales.const_data_ptr())),
+      static_cast<cutlass::float_e4m3_t**>(a_ptrs.mutable_data_ptr()),
+      static_cast<cutlass::float_e4m3_t**>(b_ptrs.mutable_data_ptr()),
+      static_cast<float**>(a_scales_ptrs.mutable_data_ptr()),
+      static_cast<float**>(b_scales_ptrs.mutable_data_ptr()),
+      static_cast<T**>(out_ptrs.mutable_data_ptr()));
   if (!is_h20_device) {
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigLowMHx00> lm_psf(
-        static_cast<int*>(lm_problem_sizes.data_ptr()));
+        static_cast<int*>(lm_problem_sizes.mutable_data_ptr()));
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigMiddleMHx00> mm_psf(
-        static_cast<int*>(mm_problem_sizes.data_ptr()));
+        static_cast<int*>(mm_problem_sizes.mutable_data_ptr()));
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigHighMHx00> hm_psf(
-        static_cast<int*>(hm_problem_sizes.data_ptr()));
+        static_cast<int*>(hm_problem_sizes.mutable_data_ptr()));
     groupedGemmPreComputeKernel<<<1, num_experts, 0, stream>>>(
-        static_cast<int*>(problem_sizes.data_ptr()), of, sf_layout, lm_psf, mm_psf, hm_psf);
+        const_cast<int*>(static_cast<const int*>(problem_sizes.const_data_ptr())),
+        of,
+        sf_layout,
+        lm_psf,
+        mm_psf,
+        hm_psf);
   } else {
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigLowMH20> lm_psf(
-        static_cast<int*>(lm_problem_sizes.data_ptr()));
+        static_cast<int*>(lm_problem_sizes.mutable_data_ptr()));
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigMiddleMH20> mm_psf(
-        static_cast<int*>(mm_problem_sizes.data_ptr()));
+        static_cast<int*>(mm_problem_sizes.mutable_data_ptr()));
     struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigHighMH20> hm_psf(
-        static_cast<int*>(hm_problem_sizes.data_ptr()));
+        static_cast<int*>(hm_problem_sizes.mutable_data_ptr()));
     groupedGemmPreComputeKernel<<<1, num_experts, 0, stream>>>(
-        static_cast<int*>(problem_sizes.data_ptr()), of, sf_layout, lm_psf, mm_psf, hm_psf);
+        const_cast<int*>(static_cast<const int*>(problem_sizes.const_data_ptr())),
+        of,
+        sf_layout,
+        lm_psf,
+        mm_psf,
+        hm_psf);
   }
 }
 
 template <typename GemmTraits>
 void launch_sm90_fp8_blockwise_scaled_group_mm(
-    torch::Tensor& out_ptrs,
-    const torch::Tensor& a_ptrs,
-    const torch::Tensor& b_ptrs,
-    const torch::Tensor& a_scales_ptrs,
-    const torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_d,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& workspace,
+    torch::stable::Tensor& out_ptrs,
+    const torch::stable::Tensor& a_ptrs,
+    const torch::stable::Tensor& b_ptrs,
+    const torch::stable::Tensor& a_scales_ptrs,
+    const torch::stable::Tensor& b_scales_ptrs,
+    const torch::stable::Tensor& stride_a,
+    const torch::stable::Tensor& stride_b,
+    const torch::stable::Tensor& stride_d,
+    const torch::stable::Tensor& layout_sfa,
+    const torch::stable::Tensor& layout_sfb,
+    const torch::stable::Tensor& problem_sizes,
+    const torch::stable::Tensor& workspace,
     cudaStream_t stream,
     int sm_count) {
   using ElementA = typename GemmTraits::ElementA;
@@ -118,23 +131,28 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   Gemm gemm_op;
 
   typename GemmKernel::MainloopArguments mainloop_args{
-      static_cast<const ElementA**>(a_ptrs.data_ptr()),
-      static_cast<StrideA*>(stride_a.data_ptr()),
-      static_cast<const ElementB**>(b_ptrs.data_ptr()),
-      static_cast<StrideB*>(stride_b.data_ptr()),
-      static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr()),
-      reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
-      static_cast<const ElementAccumulator**>(b_scales_ptrs.data_ptr()),
-      reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
+      static_cast<const ElementA**>(const_cast<void*>(a_ptrs.const_data_ptr())),
+      static_cast<StrideA*>(const_cast<void*>(stride_a.const_data_ptr())),
+      static_cast<const ElementB**>(const_cast<void*>(b_ptrs.const_data_ptr())),
+      static_cast<StrideB*>(const_cast<void*>(stride_b.const_data_ptr())),
+      static_cast<const ElementAccumulator**>(const_cast<void*>(a_scales_ptrs.const_data_ptr())),
+      reinterpret_cast<LayoutSFA*>(const_cast<void*>(layout_sfa.const_data_ptr())),
+      static_cast<const ElementAccumulator**>(const_cast<void*>(b_scales_ptrs.const_data_ptr())),
+      reinterpret_cast<LayoutSFB*>(const_cast<void*>(layout_sfb.const_data_ptr()))};
 
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = c10::cuda::current_device();
+  hw_info.device_id = torch::stable::accelerator::getCurrentDeviceIndex();
   hw_info.sm_count = sm_count;
 
   typename GemmKernel::EpilogueArguments epilogue_args{
-      {}, nullptr, nullptr, static_cast<ElementD**>(out_ptrs.data_ptr()), static_cast<StrideD*>(stride_d.data_ptr())};
+      {},
+      nullptr,
+      nullptr,
+      static_cast<ElementD**>(const_cast<void*>(out_ptrs.const_data_ptr())),
+      static_cast<StrideD*>(const_cast<void*>(stride_d.const_data_ptr()))};
 
-  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+  UnderlyingProblemShape* problem_sizes_as_shapes =
+      static_cast<UnderlyingProblemShape*>(const_cast<void*>(problem_sizes.const_data_ptr()));
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes_as_shapes, nullptr},
@@ -143,33 +161,33 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       hw_info};
 
   auto can_implement_status = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
+  STD_TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
-  auto status = gemm_op.initialize(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
+  auto status = gemm_op.initialize(args, workspace.mutable_data_ptr(), stream);
+  STD_TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
   status = gemm_op.run(stream, nullptr);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+  STD_TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
 template <typename OutType>
 void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
-    torch::Tensor& out_ptrs,
-    const torch::Tensor& a_ptrs,
-    const torch::Tensor& b_ptrs,
-    const torch::Tensor& a_scales_ptrs,
-    const torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_d,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& lm_problem_sizes,
-    const torch::Tensor& mm_problem_sizes,
-    const torch::Tensor& hm_problem_sizes,
-    const torch::Tensor& workspace,
-    const torch::Tensor& backup_workspace_0,
-    const torch::Tensor& backup_workspace_1,
+    torch::stable::Tensor& out_ptrs,
+    const torch::stable::Tensor& a_ptrs,
+    const torch::stable::Tensor& b_ptrs,
+    const torch::stable::Tensor& a_scales_ptrs,
+    const torch::stable::Tensor& b_scales_ptrs,
+    const torch::stable::Tensor& stride_a,
+    const torch::stable::Tensor& stride_b,
+    const torch::stable::Tensor& stride_d,
+    const torch::stable::Tensor& layout_sfa,
+    const torch::stable::Tensor& layout_sfb,
+    const torch::stable::Tensor& lm_problem_sizes,
+    const torch::stable::Tensor& mm_problem_sizes,
+    const torch::stable::Tensor& hm_problem_sizes,
+    const torch::stable::Tensor& workspace,
+    const torch::stable::Tensor& backup_workspace_0,
+    const torch::stable::Tensor& backup_workspace_1,
     bool is_h20_device,
     cudaStream_t stream,
     cudaStream_t backup_stream_0,

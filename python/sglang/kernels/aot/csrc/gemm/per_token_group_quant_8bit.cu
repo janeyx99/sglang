@@ -1,10 +1,114 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp8.h>
+#ifdef TORCH_TARGET_VERSION
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Float8_e4m3fn.h>
+#include <torch/headeronly/util/Half.h>
 
-#include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
+#include "gemm/gemm_ops.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using Tensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define CHECK_CUDA(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_EQ(a, b) STD_TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+#define SGL_CURRENT_CUDA_STREAM() sgl_kernel::stable::get_current_cuda_stream()
+#define SGL_INPUT_PTR(tensor, type) stable_input_ptr<type>(tensor)
+#define SGL_OUTPUT_Q_PTR(tensor, type) stable_output_q_ptr<type>(tensor)
+#define SGL_OUTPUT_S_PTR(tensor, type) stable_output_s_ptr<type>(tensor)
+#ifdef FLASHINFER_ENABLE_BF16
+#define SGL_DISPATCH_CASE_BF16(c_type, ...) \
+  case ScalarType::BFloat16: {              \
+    using c_type = nv_bfloat16;             \
+    return __VA_ARGS__();                   \
+  }
+#else
+#define SGL_DISPATCH_CASE_BF16(c_type, ...)
+#endif
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...)                                                       \
+  [&]() -> bool {                                                                                      \
+    const auto scalar_type = TYPE;                                                                     \
+    switch (scalar_type) {                                                                             \
+      case ScalarType::Float: {                                                                        \
+        using scalar_t = float;                                                                        \
+        return __VA_ARGS__();                                                                          \
+      }                                                                                                \
+      case ScalarType::Half: {                                                                         \
+        using scalar_t = nv_half;                                                                      \
+        return __VA_ARGS__();                                                                          \
+      }                                                                                                \
+        SGL_DISPATCH_CASE_BF16(scalar_t, __VA_ARGS__)                                                  \
+      default:                                                                                         \
+        STD_TORCH_CHECK(                                                                               \
+            false,                                                                                     \
+            NAME                                                                                       \
+            "(at::Tensor, at::Tensor, at::Tensor, int64_t, double, double, double, bool)::<lambda()> " \
+            "failed to "                                                                               \
+            "dispatch data type ",                                                                     \
+            torch::headeronly::toString(scalar_type));                                                 \
+        return false;                                                                                  \
+    }                                                                                                  \
+  }()
+
+template <typename T>
+const T* stable_input_ptr(const Tensor& tensor) {
+  if constexpr (std::is_same_v<T, nv_half>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::Half>());
+  } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+    return reinterpret_cast<const T*>(tensor.const_data_ptr<torch::headeronly::BFloat16>());
+  } else {
+    return tensor.const_data_ptr<T>();
+  }
+}
+
+template <typename T>
+void* stable_output_q_ptr(Tensor& tensor) {
+  if constexpr (std::is_same_v<T, int8_t>) {
+    return tensor.mutable_data_ptr<int8_t>();
+  } else {
+    static_assert(std::is_same_v<T, __nv_fp8_e4m3>);
+    return reinterpret_cast<T*>(tensor.mutable_data_ptr<torch::headeronly::Float8_e4m3fn>());
+  }
+}
+
+template <typename T>
+T* stable_output_s_ptr(Tensor& tensor) {
+  if constexpr (std::is_same_v<T, uint32_t>) {
+    return reinterpret_cast<T*>(tensor.mutable_data_ptr<int32_t>());
+  } else {
+    static_assert(std::is_same_v<T, float>);
+    return tensor.mutable_data_ptr<float>();
+  }
+}
+#else
+#include <ATen/cuda/CUDAContext.h>
 
 #include "utils.h"
+
+using Tensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+
+#define SGL_CURRENT_CUDA_STREAM() at::cuda::getCurrentCUDAStream()
+#define SGL_INPUT_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_OUTPUT_Q_PTR(tensor, type) tensor.data_ptr()
+#define SGL_OUTPUT_S_PTR(tensor, type) static_cast<type*>(tensor.data_ptr())
+#define SGL_DISPATCH_FLOAT_FP16(TYPE, NAME, ...) DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(TYPE, scalar_t, __VA_ARGS__)
+#endif
+
+#include <cuda_fp8.h>
+
+#include <cassert>
+#include <cmath>
+#include <flashinfer/vec_dtypes.cuh>
+#include <type_traits>
 
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
@@ -114,9 +218,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 }
 
 void sgl_per_token_group_quant_8bit(
-    torch::Tensor input,
-    torch::Tensor output_q,
-    torch::Tensor output_s,
+    Tensor input,
+    Tensor output_q,
+    Tensor output_s,
     int64_t group_size,
     double eps,
     double min_8bit,
@@ -130,7 +234,7 @@ void sgl_per_token_group_quant_8bit(
   CHECK_EQ(input.numel() % group_size, 0);
   CHECK_EQ(output_s.dim(), 2);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = SGL_CURRENT_CUDA_STREAM();
 
   constexpr int THREADS_PER_GROUP = 16;
 
@@ -162,9 +266,9 @@ void sgl_per_token_group_quant_8bit(
     if (is_column_major) {                                                                        \
       if (scale_ue8m0) {                                                                          \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<uint32_t*>(output_s.data_ptr()),                                          \
+            SGL_INPUT_PTR(input, T),                                                              \
+            SGL_OUTPUT_Q_PTR(output_q, DST_DTYPE),                                                \
+            SGL_OUTPUT_S_PTR(output_s, uint32_t),                                                 \
             group_size,                                                                           \
             num_groups,                                                                           \
             groups_per_block,                                                                     \
@@ -175,9 +279,9 @@ void sgl_per_token_group_quant_8bit(
             scale_stride);                                                                        \
       } else {                                                                                    \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<float*>(output_s.data_ptr()),                                             \
+            SGL_INPUT_PTR(input, T),                                                              \
+            SGL_OUTPUT_Q_PTR(output_q, DST_DTYPE),                                                \
+            SGL_OUTPUT_S_PTR(output_s, float),                                                    \
             group_size,                                                                           \
             num_groups,                                                                           \
             groups_per_block,                                                                     \
@@ -190,9 +294,9 @@ void sgl_per_token_group_quant_8bit(
     } else {                                                                                      \
       assert(!scale_ue8m0);                                                                       \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
-          static_cast<T*>(input.data_ptr()),                                                      \
-          output_q.data_ptr(),                                                                    \
-          static_cast<float*>(output_s.data_ptr()),                                               \
+          SGL_INPUT_PTR(input, T),                                                                \
+          SGL_OUTPUT_Q_PTR(output_q, DST_DTYPE),                                                  \
+          SGL_OUTPUT_S_PTR(output_s, float),                                                      \
           group_size,                                                                             \
           num_groups,                                                                             \
           groups_per_block,                                                                       \
@@ -202,11 +306,11 @@ void sgl_per_token_group_quant_8bit(
     }                                                                                             \
   } while (0)
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
-    if (dst_type == at::ScalarType::Char) {
+  SGL_DISPATCH_FLOAT_FP16(input.scalar_type(), "sgl_per_token_group_quant_8bit", [&] {
+    if (dst_type == ScalarType::Char) {
       LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
-    } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
+    } else if (dst_type == ScalarType::Float8_e4m3fn) {
       LAUNCH_KERNEL(scalar_t, __nv_fp8_e4m3);
       return true;
     }
@@ -215,3 +319,16 @@ void sgl_per_token_group_quant_8bit(
 
 #undef LAUNCH_KERNEL
 }
+
+#ifdef TORCH_TARGET_VERSION
+#undef CHECK_CUDA
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+#undef CHECK_EQ
+#undef SGL_DISPATCH_CASE_BF16
+#endif
+#undef SGL_CURRENT_CUDA_STREAM
+#undef SGL_INPUT_PTR
+#undef SGL_OUTPUT_Q_PTR
+#undef SGL_OUTPUT_S_PTR
+#undef SGL_DISPATCH_FLOAT_FP16

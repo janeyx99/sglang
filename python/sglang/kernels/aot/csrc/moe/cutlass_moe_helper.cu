@@ -1,8 +1,6 @@
 #pragma once
 
-#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
-#include <torch/all.h>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
@@ -81,62 +79,64 @@ __global__ void get_group_gemm_starts(
 }
 
 #define __CALL_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE, LayoutSFA, LayoutSFB, ScaleConfig)         \
-  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                 \
+  else if (out_tensors.scalar_type() == TENSOR_C_TYPE) {                                           \
     get_group_gemm_starts<cutlass::float_e4m3_t, C_TYPE, float, LayoutSFA, LayoutSFB, ScaleConfig> \
         <<<1, num_experts, 0, stream>>>(                                                           \
-            static_cast<int32_t*>(expert_offsets.data_ptr()),                                      \
-            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                               \
-            static_cast<cutlass::float_e4m3_t**>(b_ptrs.data_ptr()),                               \
-            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                            \
-            static_cast<float**>(a_scales_ptrs.data_ptr()),                                        \
-            static_cast<float**>(b_scales_ptrs.data_ptr()),                                        \
-            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                             \
-            static_cast<cutlass::float_e4m3_t*>(b_tensors.data_ptr()),                             \
-            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                          \
-            static_cast<float*>(a_scales.data_ptr()),                                              \
-            static_cast<float*>(b_scales.data_ptr()),                                              \
-            reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),                                   \
-            reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr()),                                   \
-            static_cast<int*>(problem_sizes.data_ptr()),                                           \
-            static_cast<int*>(problem_sizes_transpose.data_ptr()),                                 \
+            static_cast<int32_t*>(SGL_CONST_RAW_PTR(expert_offsets)),                              \
+            static_cast<cutlass::float_e4m3_t**>(SGL_MUTABLE_RAW_PTR(a_ptrs)),                     \
+            static_cast<cutlass::float_e4m3_t**>(SGL_MUTABLE_RAW_PTR(b_ptrs)),                     \
+            static_cast<C_TYPE**>(SGL_MUTABLE_RAW_PTR(out_ptrs)),                                  \
+            static_cast<float**>(SGL_MUTABLE_RAW_PTR(a_scales_ptrs)),                              \
+            static_cast<float**>(SGL_MUTABLE_RAW_PTR(b_scales_ptrs)),                              \
+            static_cast<cutlass::float_e4m3_t*>(SGL_CONST_RAW_PTR(a_tensors)),                     \
+            static_cast<cutlass::float_e4m3_t*>(SGL_CONST_RAW_PTR(b_tensors)),                     \
+            static_cast<C_TYPE*>(SGL_MUTABLE_RAW_PTR(out_tensors)),                                \
+            static_cast<float*>(SGL_CONST_RAW_PTR(a_scales)),                                      \
+            static_cast<float*>(SGL_CONST_RAW_PTR(b_scales)),                                      \
+            reinterpret_cast<LayoutSFA*>(SGL_MUTABLE_RAW_PTR(layout_sfa)),                         \
+            reinterpret_cast<LayoutSFB*>(SGL_MUTABLE_RAW_PTR(layout_sfb)),                         \
+            static_cast<int*>(SGL_CONST_RAW_PTR(problem_sizes)),                                   \
+            static_cast<int*>(SGL_MUTABLE_RAW_PTR(problem_sizes_transpose)),                       \
             transpose);                                                                            \
   }
 
 namespace {
 template <typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>
 void run_get_group_gemm_starts(
-    torch::Tensor const& expert_offsets,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor& out_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& layout_sfa,
-    torch::Tensor const& layout_sfb,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor& problem_sizes_transpose,
+    const TorchTensor& expert_offsets,
+    TorchTensor& a_ptrs,
+    TorchTensor& b_ptrs,
+    TorchTensor& out_ptrs,
+    TorchTensor& a_scales_ptrs,
+    TorchTensor& b_scales_ptrs,
+    const TorchTensor& a_tensors,
+    const TorchTensor& b_tensors,
+    TorchTensor& out_tensors,
+    const TorchTensor& a_scales,
+    const TorchTensor& b_scales,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    TorchTensor& problem_sizes_transpose,
     bool transpose = false) {
-  TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(b_tensors.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
-  TORCH_CHECK(b_scales.dtype() == torch::kFloat32);
-  TORCH_CHECK(out_tensors.size(1) % 128 == 0 or out_tensors.size(0) % 128 == 0);
-  TORCH_CHECK(a_tensors.size(1) % 128 == 0 or a_tensors.size(0) % 128 == 0);
+  SGL_CHECK_NO_MSG_TEXT(
+      a_tensors.scalar_type() == ScalarType::Float8_e4m3fn, "a_tensors.dtype() == torch::kFloat8_e4m3fn");
+  SGL_CHECK_NO_MSG_TEXT(
+      b_tensors.scalar_type() == ScalarType::Float8_e4m3fn, "b_tensors.dtype() == torch::kFloat8_e4m3fn");
+  SGL_CHECK_NO_MSG_TEXT(a_scales.scalar_type() == ScalarType::Float, "a_scales.dtype() == torch::kFloat32");
+  SGL_CHECK_NO_MSG_TEXT(b_scales.scalar_type() == ScalarType::Float, "b_scales.dtype() == torch::kFloat32");
+  SGL_CHECK_NO_MSG(out_tensors.size(1) % 128 == 0 or out_tensors.size(0) % 128 == 0);
+  SGL_CHECK_NO_MSG(a_tensors.size(1) % 128 == 0 or a_tensors.size(0) % 128 == 0);
 
   int num_experts = (int)expert_offsets.size(0);
-  auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
+  auto stream = SGL_TENSOR_CUDA_STREAM(a_tensors);
 
   if (false) {
   }
-  __CALL_GET_STARTS_KERNEL(torch::kBFloat16, cutlass::bfloat16_t, LayoutSFA, LayoutSFB, ScaleConfig)
-  __CALL_GET_STARTS_KERNEL(torch::kFloat16, half, LayoutSFA, LayoutSFB, ScaleConfig)
+  __CALL_GET_STARTS_KERNEL(ScalarType::BFloat16, cutlass::bfloat16_t, LayoutSFA, LayoutSFB, ScaleConfig)
+  __CALL_GET_STARTS_KERNEL(ScalarType::Half, half, LayoutSFA, LayoutSFB, ScaleConfig)
   else {
-    TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
+    SGL_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
   }
 }
 }  // namespace

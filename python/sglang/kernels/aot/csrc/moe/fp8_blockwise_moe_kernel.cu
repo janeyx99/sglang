@@ -1,7 +1,6 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cutlass/arch/arch.h>
-#include <torch/all.h>
+
+#include <string>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -24,8 +23,84 @@
 #include "cutlass/util/reference/device/gemm.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/tensor_view_io.h"
-#include "cutlass_moe_helper.cu"
+
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
+#include "moe/moe_ops.h"
+#include "moe/moe_stable_utils.h"
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
+
+using TorchTensor = torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+#define SGL_CHECK(...) STD_TORCH_CHECK(__VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition_)                                                                  \
+  STD_TORCH_CHECK(                                                                                    \
+      (condition_),                                                                                   \
+      "Expected " #condition_                                                                         \
+      " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+      "enhancement request to PyTorch.)")
+#define SGL_CHECK_NO_MSG_TEXT(condition_, condition_text_)                                            \
+  STD_TORCH_CHECK(                                                                                    \
+      (condition_),                                                                                   \
+      "Expected " condition_text_                                                                     \
+      " to be true, but got false.  (Could this error message be improved?  If so, please report an " \
+      "enhancement request to PyTorch.)")
+#define SGL_CHECK_NOT_IMPLEMENTED(condition_, ...) STD_TORCH_CHECK((condition_), "NotImplementedError: ", __VA_ARGS__)
+#define SGL_CONST_RAW_PTR(tensor_) const_cast<void*>((tensor_).const_data_ptr())
+#define SGL_MUTABLE_RAW_PTR(tensor_) (tensor_).mutable_data_ptr()
+#define SGL_CURRENT_DEVICE_INDEX() torch::stable::accelerator::getCurrentDeviceIndex()
+#define SGL_CURRENT_DEVICE_PROPERTIES() (&sgl_kernel::stable::get_cached_device_properties())
+#define SGL_DEVICE_GUARD(name_, tensor_)                                                           \
+  STD_TORCH_CHECK((tensor_).is_cuda(), "CUDAGuardImpl initialized with non-CUDA DeviceType: cpu"); \
+  const torch::stable::accelerator::DeviceGuard name_((tensor_).get_device_index())
+#define SGL_TENSOR_CUDA_STREAM(tensor_) sgl_kernel::stable::get_current_cuda_stream((tensor_).get_device_index())
+#define SGL_NEW_EMPTY_INT64(self_, size_) \
+  sgl_kernel::moe::stable::empty_contiguous_like((self_), (size_), ScalarType::Long)
+#define SGL_TRANSPOSE(tensor_, dim0_, dim1_) torch::stable::transpose((tensor_), (dim0_), (dim1_))
+
+inline int get_current_sm_version() {
+  const auto& device_prop = sgl_kernel::stable::get_cached_device_properties();
+  return device_prop.major * 10 + device_prop.minor;
+}
+
+#define SGL_GET_SM_VERSION() get_current_sm_version()
+#else
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
+
 #include "utils.h"
+
+using TorchTensor = torch::Tensor;
+using ScalarType = at::ScalarType;
+
+#define SGL_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+#define SGL_CHECK_NO_MSG(condition_) TORCH_CHECK(condition_)
+#define SGL_CHECK_NO_MSG_TEXT(condition_, condition_text_) TORCH_CHECK(condition_)
+#define SGL_CHECK_NOT_IMPLEMENTED(...) TORCH_CHECK_NOT_IMPLEMENTED(__VA_ARGS__)
+#define SGL_CONST_RAW_PTR(tensor_) (tensor_).data_ptr()
+#define SGL_MUTABLE_RAW_PTR(tensor_) (tensor_).data_ptr()
+#define SGL_CURRENT_DEVICE_INDEX() c10::cuda::current_device()
+#define SGL_CURRENT_DEVICE_PROPERTIES() at::cuda::getCurrentDeviceProperties()
+#define SGL_DEVICE_GUARD(name_, tensor_) \
+  at::cuda::CUDAGuard name_ {            \
+    (char)(tensor_).get_device()         \
+  }
+#define SGL_TENSOR_CUDA_STREAM(tensor_) at::cuda::getCurrentCUDAStream((tensor_).get_device())
+#define SGL_NEW_EMPTY_INT64(self_, size_) \
+  torch::empty((size_), torch::TensorOptions().dtype(torch::kInt64).device((self_).device()))
+#define SGL_TRANSPOSE(tensor_, dim0_, dim1_) (tensor_).transpose((dim0_), (dim1_))
+#define SGL_GET_SM_VERSION() getSMVersion()
+#endif
+
+#include "cutlass_moe_helper.cu"
 
 using namespace cute;
 
@@ -33,19 +108,19 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 template <typename OutType, typename ScheduleConfig, typename LayoutD>
 void launch_sm90_fp8_blockwise_scaled_group_mm(
-    torch::Tensor& out_ptrs,
-    const torch::Tensor& a_ptrs,
-    const torch::Tensor& b_ptrs,
-    const torch::Tensor& a_scales_ptrs,
-    const torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace) {
+    TorchTensor& out_ptrs,
+    const TorchTensor& a_ptrs,
+    const TorchTensor& b_ptrs,
+    const TorchTensor& a_scales_ptrs,
+    const TorchTensor& b_scales_ptrs,
+    const TorchTensor& stride_a,
+    const TorchTensor& stride_b,
+    const TorchTensor& stride_c,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    const TorchTensor& expert_offsets,
+    const TorchTensor& workspace) {
   using ElementA = cutlass::float_e4m3_t;
   using ElementB = cutlass::float_e4m3_t;
   using ElementC = void;
@@ -114,27 +189,28 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   Gemm gemm_op;
 
   typename GemmKernel::MainloopArguments mainloop_args{
-      static_cast<const ElementA**>(a_ptrs.data_ptr()),
-      static_cast<StrideA*>(stride_a.data_ptr()),
-      static_cast<const ElementB**>(b_ptrs.data_ptr()),
-      static_cast<StrideB*>(stride_b.data_ptr()),
-      static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr()),
-      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(layout_sfa.data_ptr()),
-      static_cast<const ElementAccumulator**>(b_scales_ptrs.data_ptr()),
-      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
+      static_cast<const ElementA**>(SGL_CONST_RAW_PTR(a_ptrs)),
+      static_cast<StrideA*>(SGL_CONST_RAW_PTR(stride_a)),
+      static_cast<const ElementB**>(SGL_CONST_RAW_PTR(b_ptrs)),
+      static_cast<StrideB*>(SGL_CONST_RAW_PTR(stride_b)),
+      static_cast<const ElementAccumulator**>(SGL_CONST_RAW_PTR(a_scales_ptrs)),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(SGL_CONST_RAW_PTR(layout_sfa)),
+      static_cast<const ElementAccumulator**>(SGL_CONST_RAW_PTR(b_scales_ptrs)),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(SGL_CONST_RAW_PTR(layout_sfb))};
 
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = c10::cuda::current_device();
-  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  hw_info.device_id = SGL_CURRENT_DEVICE_INDEX();
+  hw_info.sm_count = SGL_CURRENT_DEVICE_PROPERTIES()->multiProcessorCount;
 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
       nullptr,
-      static_cast<StrideC*>(stride_c.data_ptr()),
-      static_cast<ElementD**>(out_ptrs.data_ptr()),
-      static_cast<StrideC*>(stride_c.data_ptr())};
+      static_cast<StrideC*>(SGL_CONST_RAW_PTR(stride_c)),
+      static_cast<ElementD**>(SGL_MUTABLE_RAW_PTR(out_ptrs)),
+      static_cast<StrideC*>(SGL_CONST_RAW_PTR(stride_c))};
 
-  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+  UnderlyingProblemShape* problem_sizes_as_shapes =
+      static_cast<UnderlyingProblemShape*>(SGL_CONST_RAW_PTR(problem_sizes));
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes_as_shapes, nullptr},
@@ -142,34 +218,34 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       epilogue_args,
       hw_info};
 
-  at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
+  SGL_DEVICE_GUARD(device_guard, a_ptrs);
+  const cudaStream_t stream = SGL_TENSOR_CUDA_STREAM(a_ptrs);
 
   auto can_implement_status = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
+  SGL_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
-  auto status = gemm_op.initialize(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
+  auto status = gemm_op.initialize(args, SGL_MUTABLE_RAW_PTR(workspace), stream);
+  SGL_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
   status = gemm_op.run(stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+  SGL_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
 template <typename OutType, typename ScheduleConfig, typename LayoutD>
 void launch_sm100_fp8_blockwise_scaled_group_mm(
-    torch::Tensor& out_ptrs,
-    const torch::Tensor& a_ptrs,
-    const torch::Tensor& b_ptrs,
-    const torch::Tensor& a_scales_ptrs,
-    const torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace) {
+    TorchTensor& out_ptrs,
+    const TorchTensor& a_ptrs,
+    const TorchTensor& b_ptrs,
+    const TorchTensor& a_scales_ptrs,
+    const TorchTensor& b_scales_ptrs,
+    const TorchTensor& stride_a,
+    const TorchTensor& stride_b,
+    const TorchTensor& stride_c,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    const TorchTensor& expert_offsets,
+    const TorchTensor& workspace) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
   using ElementA = cutlass::float_e4m3_t;
   using ElementB = cutlass::float_e4m3_t;
@@ -232,14 +308,14 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
   Gemm gemm_op;
 
   typename GemmKernel::MainloopArguments mainloop_args{
-      static_cast<const ElementA**>(a_ptrs.data_ptr()),
-      static_cast<StrideA*>(stride_a.data_ptr()),
-      static_cast<const ElementB**>(b_ptrs.data_ptr()),
-      static_cast<StrideB*>(stride_b.data_ptr()),
-      static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr()),
-      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(layout_sfa.data_ptr()),
-      static_cast<const ElementAccumulator**>(b_scales_ptrs.data_ptr()),
-      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
+      static_cast<const ElementA**>(SGL_CONST_RAW_PTR(a_ptrs)),
+      static_cast<StrideA*>(SGL_CONST_RAW_PTR(stride_a)),
+      static_cast<const ElementB**>(SGL_CONST_RAW_PTR(b_ptrs)),
+      static_cast<StrideB*>(SGL_CONST_RAW_PTR(stride_b)),
+      static_cast<const ElementAccumulator**>(SGL_CONST_RAW_PTR(a_scales_ptrs)),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(SGL_CONST_RAW_PTR(layout_sfa)),
+      static_cast<const ElementAccumulator**>(SGL_CONST_RAW_PTR(b_scales_ptrs)),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(SGL_CONST_RAW_PTR(layout_sfb))};
 
   cutlass::KernelHardwareInfo hw_info;
 
@@ -249,11 +325,12 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
       nullptr,
-      static_cast<StrideC*>(stride_c.data_ptr()),
-      static_cast<ElementD**>(out_ptrs.data_ptr()),
-      static_cast<StrideC*>(stride_c.data_ptr())};
+      static_cast<StrideC*>(SGL_CONST_RAW_PTR(stride_c)),
+      static_cast<ElementD**>(SGL_MUTABLE_RAW_PTR(out_ptrs)),
+      static_cast<StrideC*>(SGL_CONST_RAW_PTR(stride_c))};
 
-  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+  UnderlyingProblemShape* problem_sizes_as_shapes =
+      static_cast<UnderlyingProblemShape*>(SGL_CONST_RAW_PTR(problem_sizes));
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes_as_shapes, nullptr},
@@ -261,39 +338,39 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       epilogue_args,
       hw_info};
 
-  at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
+  SGL_DEVICE_GUARD(device_guard, a_ptrs);
+  const cudaStream_t stream = SGL_TENSOR_CUDA_STREAM(a_ptrs);
 
   auto can_implement_status = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
+  SGL_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
-  auto status = gemm_op.initialize(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
+  auto status = gemm_op.initialize(args, SGL_MUTABLE_RAW_PTR(workspace), stream);
+  SGL_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
   status = gemm_op.run(stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+  SGL_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
 template <typename OutType>
 void sm100_fp8_blockwise_group_mm_dispatch_shape(
-    torch::Tensor& output,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace) {
+    TorchTensor& output,
+    TorchTensor& a_ptrs,
+    TorchTensor& b_ptrs,
+    TorchTensor& out_ptrs,
+    TorchTensor& a_scales_ptrs,
+    TorchTensor& b_scales_ptrs,
+    const TorchTensor& a,
+    const TorchTensor& b,
+    const TorchTensor& scales_a,
+    const TorchTensor& scales_b,
+    const TorchTensor& stride_a,
+    const TorchTensor& stride_b,
+    const TorchTensor& stride_c,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    const TorchTensor& expert_offsets,
+    const TorchTensor& workspace) {
   // Check the first matrix size to decide on the configuration
   // Assuming all matrices in the group have similar size characteristics
   // bool use_small_config = a[0].size(0) <= 128;
@@ -331,13 +408,12 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
   int num_experts = (int)expert_offsets.size(0);
-  torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
-  torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-  torch::Tensor output_t = output.t();
-  torch::Tensor a_t = a.t();
-  torch::Tensor b_t = b.transpose(1, 2);
-  torch::Tensor scales_a_t = scales_a.t();
-  torch::Tensor scales_b_t = scales_b.transpose(1, 2);
+  TorchTensor problem_sizes_transpose = SGL_NEW_EMPTY_INT64(a, num_experts * 3);
+  TorchTensor output_t = SGL_TRANSPOSE(output, 0, 1);
+  TorchTensor a_t = SGL_TRANSPOSE(a, 0, 1);
+  TorchTensor b_t = SGL_TRANSPOSE(b, 1, 2);
+  TorchTensor scales_a_t = SGL_TRANSPOSE(scales_a, 0, 1);
+  TorchTensor scales_b_t = SGL_TRANSPOSE(scales_b, 1, 2);
 
   if (a.size(0) <= 2048 && a.size(1) >= 2048) {
     run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
@@ -371,7 +447,7 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
         problem_sizes_transpose,
         expert_offsets,
         workspace);
-    output = output_t.t();
+    output = SGL_TRANSPOSE(output_t, 0, 1);
   } else if (a.size(0) > 2048 && a.size(1) >= 2048) {
     run_get_group_gemm_starts<MmaConfig2::LayoutSFA, MmaConfig2::LayoutSFB, MmaConfig2::ScaleConfig>(
         expert_offsets,
@@ -439,24 +515,24 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
 
 template <typename OutType>
 void sm90_fp8_blockwise_group_mm_dispatch_shape(
-    torch::Tensor& output,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace) {
+    TorchTensor& output,
+    TorchTensor& a_ptrs,
+    TorchTensor& b_ptrs,
+    TorchTensor& out_ptrs,
+    TorchTensor& a_scales_ptrs,
+    TorchTensor& b_scales_ptrs,
+    const TorchTensor& a,
+    const TorchTensor& b,
+    const TorchTensor& scales_a,
+    const TorchTensor& scales_b,
+    const TorchTensor& stride_a,
+    const TorchTensor& stride_b,
+    const TorchTensor& stride_c,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    const TorchTensor& expert_offsets,
+    const TorchTensor& workspace) {
   struct MmaConfigSmallM {
     // Swap A/B
     using ElementA = cutlass::float_e4m3_t;
@@ -496,16 +572,15 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   };
 
   int num_experts = (int)expert_offsets.size(0);
-  torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
-  torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-  torch::Tensor output_t = output.t();
-  torch::Tensor a_t = a.t();
-  torch::Tensor b_t = b.transpose(1, 2);
-  torch::Tensor scales_a_t = scales_a.t();
-  torch::Tensor scales_b_t = scales_b.transpose(1, 2);
+  TorchTensor problem_sizes_transpose = SGL_NEW_EMPTY_INT64(a, num_experts * 3);
+  TorchTensor output_t = SGL_TRANSPOSE(output, 0, 1);
+  TorchTensor a_t = SGL_TRANSPOSE(a, 0, 1);
+  TorchTensor b_t = SGL_TRANSPOSE(b, 1, 2);
+  TorchTensor scales_a_t = SGL_TRANSPOSE(scales_a, 0, 1);
+  TorchTensor scales_b_t = SGL_TRANSPOSE(scales_b, 1, 2);
 
   const std::string H20_device_type_str("NVIDIA H20");
-  bool is_h20_device = std::string(at::cuda::getCurrentDeviceProperties()->name) == H20_device_type_str;
+  bool is_h20_device = std::string(SGL_CURRENT_DEVICE_PROPERTIES()->name) == H20_device_type_str;
 
   if (a.size(0) <= 2048) {
     run_get_group_gemm_starts<MmaConfigSmallM::LayoutSFA, MmaConfigSmallM::LayoutSFB, MmaConfigSmallM::ScaleConfig>(
@@ -539,7 +614,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         problem_sizes_transpose,
         expert_offsets,
         workspace);
-    output = output_t.t();
+    output = SGL_TRANSPOSE(output_t, 0, 1);
   } else {
     if (is_h20_device && a.size(1) > 128) {
       // For H20 with K > 128, use Pingpong Schedule
@@ -648,63 +723,63 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
  *       pattern for better GPU efficiency. This transformation is done within the kernel.
  */
 void fp8_blockwise_scaled_grouped_mm(
-    torch::Tensor& output,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace) {
-  TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
-  TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have shape (num_experts, 3)");
-  TORCH_CHECK(
+    TorchTensor& output,
+    TorchTensor& a_ptrs,
+    TorchTensor& b_ptrs,
+    TorchTensor& out_ptrs,
+    TorchTensor& a_scales_ptrs,
+    TorchTensor& b_scales_ptrs,
+    const TorchTensor& a,
+    const TorchTensor& b,
+    const TorchTensor& scales_a,
+    const TorchTensor& scales_b,
+    const TorchTensor& stride_a,
+    const TorchTensor& stride_b,
+    const TorchTensor& stride_c,
+    const TorchTensor& layout_sfa,
+    const TorchTensor& layout_sfb,
+    const TorchTensor& problem_sizes,
+    const TorchTensor& expert_offsets,
+    const TorchTensor& workspace) {
+  SGL_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
+  SGL_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have shape (num_experts, 3)");
+  SGL_CHECK(
       problem_sizes.size(0) == expert_offsets.size(0), "Number of experts in problem_sizes must match expert_offsets");
-  TORCH_CHECK(problem_sizes.dtype() == torch::kInt32, "problem_sizes must be int32");
-  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "a must be kFloat8_e4m3fn");
-  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn, "b must be kFloat8_e4m3fn");
-  TORCH_CHECK(
-      output.scalar_type() == torch::kBFloat16 || output.scalar_type() == torch::kHalf,
+  SGL_CHECK(problem_sizes.scalar_type() == ScalarType::Int, "problem_sizes must be int32");
+  SGL_CHECK(a.scalar_type() == ScalarType::Float8_e4m3fn, "a must be kFloat8_e4m3fn");
+  SGL_CHECK(b.scalar_type() == ScalarType::Float8_e4m3fn, "b must be kFloat8_e4m3fn");
+  SGL_CHECK(
+      output.scalar_type() == ScalarType::BFloat16 || output.scalar_type() == ScalarType::Half,
       "output must be bfloat16 or half");
-  TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be float32");
-  TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be float32");
-  TORCH_CHECK(stride_a.scalar_type() == torch::kInt64, "stride_a must be int64");
-  TORCH_CHECK(stride_b.scalar_type() == torch::kInt64, "stride_b must be int64");
-  TORCH_CHECK(stride_c.scalar_type() == torch::kInt64, "stride_c must be int64");
-  TORCH_CHECK(layout_sfa.scalar_type() == torch::kInt32, "layout_sfa must be int32");
-  TORCH_CHECK(layout_sfb.scalar_type() == torch::kInt32, "layout_sfb must be int32");
-  TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "expert_offsets must be int32");
+  SGL_CHECK(scales_a.scalar_type() == ScalarType::Float, "scales_a must be float32");
+  SGL_CHECK(scales_b.scalar_type() == ScalarType::Float, "scales_b must be float32");
+  SGL_CHECK(stride_a.scalar_type() == ScalarType::Long, "stride_a must be int64");
+  SGL_CHECK(stride_b.scalar_type() == ScalarType::Long, "stride_b must be int64");
+  SGL_CHECK(stride_c.scalar_type() == ScalarType::Long, "stride_c must be int64");
+  SGL_CHECK(layout_sfa.scalar_type() == ScalarType::Int, "layout_sfa must be int32");
+  SGL_CHECK(layout_sfb.scalar_type() == ScalarType::Int, "layout_sfb must be int32");
+  SGL_CHECK(expert_offsets.scalar_type() == ScalarType::Int, "expert_offsets must be int32");
 
-  TORCH_CHECK(output.dim() == 2, "output must be 2D tensor");
-  TORCH_CHECK(a.dim() == 2, "a must be 2D tensor");
-  TORCH_CHECK(b.dim() == 3, "b must be 3D tensor");
-  TORCH_CHECK(scales_a.dim() == 2, "scales_a must be 2D tensor");
-  TORCH_CHECK(scales_b.dim() == 3, "scales_b must be 3D tensor");
-  TORCH_CHECK(stride_a.dim() == 1, "stride_a must be 1D tensor");
-  TORCH_CHECK(stride_b.dim() == 1, "stride_b must be 1D tensor");
-  TORCH_CHECK(stride_c.dim() == 1, "stride_c must be 1D tensor");
-  TORCH_CHECK(layout_sfa.dim() == 2, "layout_sfa must be 1D tensor");
-  TORCH_CHECK(layout_sfb.dim() == 2, "layout_sfb must be 1D tensor");
-  TORCH_CHECK(a_ptrs.dim() == 1, "a_ptrs must be 1D tensor");
-  TORCH_CHECK(b_ptrs.dim() == 1, "b_ptrs must be 1D tensor");
-  TORCH_CHECK(out_ptrs.dim() == 1, "out_ptrs must be 1D tensor");
-  TORCH_CHECK(a_scales_ptrs.dim() == 1, "a_scales_ptrs must be 1D tensor");
-  TORCH_CHECK(b_scales_ptrs.dim() == 1, "b_scales_ptrs must be 1D tensor");
-  TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be 1D tensor");
-  TORCH_CHECK(workspace.dim() == 1, "workspace must be 1D tensor");
+  SGL_CHECK(output.dim() == 2, "output must be 2D tensor");
+  SGL_CHECK(a.dim() == 2, "a must be 2D tensor");
+  SGL_CHECK(b.dim() == 3, "b must be 3D tensor");
+  SGL_CHECK(scales_a.dim() == 2, "scales_a must be 2D tensor");
+  SGL_CHECK(scales_b.dim() == 3, "scales_b must be 3D tensor");
+  SGL_CHECK(stride_a.dim() == 1, "stride_a must be 1D tensor");
+  SGL_CHECK(stride_b.dim() == 1, "stride_b must be 1D tensor");
+  SGL_CHECK(stride_c.dim() == 1, "stride_c must be 1D tensor");
+  SGL_CHECK(layout_sfa.dim() == 2, "layout_sfa must be 1D tensor");
+  SGL_CHECK(layout_sfb.dim() == 2, "layout_sfb must be 1D tensor");
+  SGL_CHECK(a_ptrs.dim() == 1, "a_ptrs must be 1D tensor");
+  SGL_CHECK(b_ptrs.dim() == 1, "b_ptrs must be 1D tensor");
+  SGL_CHECK(out_ptrs.dim() == 1, "out_ptrs must be 1D tensor");
+  SGL_CHECK(a_scales_ptrs.dim() == 1, "a_scales_ptrs must be 1D tensor");
+  SGL_CHECK(b_scales_ptrs.dim() == 1, "b_scales_ptrs must be 1D tensor");
+  SGL_CHECK(expert_offsets.dim() == 1, "expert_offsets must be 1D tensor");
+  SGL_CHECK(workspace.dim() == 1, "workspace must be 1D tensor");
 
   bool can_implement = false;
-  auto sm_version = getSMVersion();
+  auto sm_version = SGL_GET_SM_VERSION();
 
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
@@ -716,7 +791,7 @@ void fp8_blockwise_scaled_grouped_mm(
       || sm_version == 107
 #endif
   ) {
-    if (output.scalar_type() == torch::kBFloat16) {
+    if (output.scalar_type() == ScalarType::BFloat16) {
       sm100_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
           a_ptrs,
@@ -764,7 +839,7 @@ void fp8_blockwise_scaled_grouped_mm(
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   if (sm_version == 90) {
-    if (output.scalar_type() == torch::kBFloat16) {
+    if (output.scalar_type() == ScalarType::BFloat16) {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
           a_ptrs,
@@ -808,6 +883,20 @@ void fp8_blockwise_scaled_grouped_mm(
     can_implement = true;
   }
 #endif
-  TORCH_CHECK_NOT_IMPLEMENTED(
+  SGL_CHECK_NOT_IMPLEMENTED(
       can_implement, "No implemented fp8_blockwise_scaled_grouped_mm for current compute capability: ", sm_version);
 }
+
+#undef SGL_CHECK
+#undef SGL_CHECK_NO_MSG
+#undef SGL_CHECK_NO_MSG_TEXT
+#undef SGL_CHECK_NOT_IMPLEMENTED
+#undef SGL_CONST_RAW_PTR
+#undef SGL_MUTABLE_RAW_PTR
+#undef SGL_CURRENT_DEVICE_INDEX
+#undef SGL_CURRENT_DEVICE_PROPERTIES
+#undef SGL_DEVICE_GUARD
+#undef SGL_TENSOR_CUDA_STREAM
+#undef SGL_NEW_EMPTY_INT64
+#undef SGL_TRANSPOSE
+#undef SGL_GET_SM_VERSION

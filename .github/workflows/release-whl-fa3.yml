@@ -34,8 +34,9 @@ concurrency:
 
 env:
   # Must match TORCH_VER in docker/sgl-fa3.Dockerfile and the pin in sgl_fa3/pyproject.toml:
-  # the extension uses the regular torch C++ ABI and only loads against this torch.
-  TORCH_VER: "2.14.1"
+  # build against the oldest supported stable Torch ABI.
+  TORCH_VER: "2.11.0"
+  TEST_TORCH_VER: "2.14.1"
   FA3_REPO: sgl-project/sgl-flash-attn
 
 jobs:
@@ -115,7 +116,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install "torch==${TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
-          python3 -m pip install numpy einops pytest
+          python3 -m pip install numpy einops pytest torch-abi-audit
           # --force-reinstall: a base image may already carry this version, in
           # which case pip skips the wheel and the job tests a stale extension.
           python3 -m pip install dist/*.whl --force-reinstall --no-deps
@@ -134,6 +135,21 @@ jobs:
 
       - name: Run tests
         run: python3 -m pytest sgl-flash-attn/sgl_fa3/tests -q
+
+      - name: Audit native ABI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sgl_fa3
+          library = next(Path(sgl_fa3.__file__).parent.glob("_C*.so"))
+          subprocess.run(["torch-abi-audit", str(library)], check=True)
+          PY
+
+      - name: Test the same wheel on the current Torch runtime
+        run: |
+          python3 -m pip install "torch==${TEST_TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+          python3 -m pytest sgl-flash-attn/sgl_fa3/tests -q
 
   release:
     if: |

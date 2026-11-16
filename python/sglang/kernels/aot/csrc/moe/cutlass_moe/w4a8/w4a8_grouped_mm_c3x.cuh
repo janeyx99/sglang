@@ -18,10 +18,9 @@
  * - Optimized for Hopper architecture with Tensor Core operations
  */
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include <torch/all.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -30,7 +29,12 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
+#include "moe/moe_ops.h"
+#include "moe/moe_stable_utils.h"
+#include "sgl_kernel_cuda_stream.h"
 #include "w4a8_get_group_starts.cuh"
+
+#define W4A8_MUTABLE_RAW_PTR(tensor_) (tensor_).mutable_data_ptr()
 
 using namespace cute;
 
@@ -154,17 +158,17 @@ struct cutlass_3x_w4a8_group_gemm {
 // template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 template <typename Gemm>
 void cutlass_w4a8_group_gemm_caller(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    SglTensor& d_tensors,
+    const SglTensor& a_tensors,
+    const SglTensor& b_tensors,
+    const SglTensor& a_scales,
+    const SglTensor& b_scales,
+    const SglTensor& expert_offsets,
+    const SglTensor& problem_sizes,
+    const SglTensor& a_strides,
+    const SglTensor& b_strides,
+    const SglTensor& d_strides,
+    const SglTensor& s_strides,
     int64_t chunk_size) {
   //   using Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>;
   using Args = typename Gemm::GemmScaleOnly::Arguments;
@@ -174,46 +178,48 @@ void cutlass_w4a8_group_gemm_caller(
   bool per_out_ch = b_scales.numel() != num_experts;
 
   // Check inputs
-  TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
-  TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
-  TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
-  TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
-  TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
-  TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
+  STD_TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
+  STD_TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
+  STD_TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
+  STD_TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
+  STD_TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
+  STD_TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
 
   // Check tensor shapes
-  TORCH_CHECK(problem_sizes.size(0) == num_experts, "problem_sizes must have num_experts rows");
-  TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (N, M, K)");
-  TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
-  TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(problem_sizes.size(0) == num_experts, "problem_sizes must have num_experts rows");
+  STD_TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (N, M, K)");
+  STD_TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
+  STD_TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
+  STD_TORCH_CHECK(
       b_tensors.size(2) * 2 == a_tensors.size(1) or b_tensors.size(2) * 2 == a_tensors.size(2),
       "B tensor K/2 dimension must match A tensor K dimension");
 
   // Check tensor types
-  TORCH_CHECK(a_tensors.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
-  TORCH_CHECK(b_tensors.scalar_type() == torch::kInt8, "B tensor must contain packed int4 values (stored as int8)");
-  TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "Expert offsets must be int32 type");
-  TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32, "Problem sizes must be int32 type");
+  STD_TORCH_CHECK(a_tensors.scalar_type() == SglScalarType::Float8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
+  STD_TORCH_CHECK(
+      b_tensors.scalar_type() == SglScalarType::Char, "B tensor must contain packed int4 values (stored as int8)");
+  STD_TORCH_CHECK(expert_offsets.scalar_type() == SglScalarType::Int, "Expert offsets must be int32 type");
+  STD_TORCH_CHECK(problem_sizes.scalar_type() == SglScalarType::Int, "Problem sizes must be int32 type");
 
-  auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
-  auto options_int = torch::TensorOptions().dtype(torch::kInt64).device(a_tensors.device());
+  const cudaStream_t stream = sgl_kernel::stable::get_current_cuda_stream(a_tensors.get_device_index());
 
-  torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+  const auto device = a_tensors.device();
+  const std::array<int64_t, 1> pointer_array_size{static_cast<int64_t>(num_experts)};
+  SglTensor a_ptrs = sgl_kernel::moe::stable::empty_contiguous(device, pointer_array_size, SglScalarType::Long);
+  SglTensor b_ptrs = sgl_kernel::moe::stable::empty_contiguous(device, pointer_array_size, SglScalarType::Long);
+  SglTensor out_ptrs = sgl_kernel::moe::stable::empty_contiguous(device, pointer_array_size, SglScalarType::Long);
+  SglTensor a_scales_ptrs = sgl_kernel::moe::stable::empty_contiguous(device, pointer_array_size, SglScalarType::Long);
+  SglTensor b_scales_ptrs = sgl_kernel::moe::stable::empty_contiguous(device, pointer_array_size, SglScalarType::Long);
 
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = a_tensors.device().index();
+  hw_info.device_id = a_tensors.get_device_index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
   fusion_args.alpha = 0;
   fusion_args.beta = 0;
-  fusion_args.alpha_ptr = a_scales.data_ptr<float>();
+  fusion_args.alpha_ptr = a_scales.const_data_ptr<float>();
   ;
   fusion_args.beta_ptr = nullptr;
   fusion_args.alpha_ptr_array = nullptr;
@@ -221,8 +227,8 @@ void cutlass_w4a8_group_gemm_caller(
   fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
-  ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
-      static_cast<ProblemShape::UnderlyingProblemShape*>(problem_sizes.data_ptr());
+  ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes = const_cast<ProblemShape::UnderlyingProblemShape*>(
+      static_cast<const ProblemShape::UnderlyingProblemShape*>(problem_sizes.const_data_ptr()));
 
   run_int4_fp8_get_group_gemm_starts(
       expert_offsets,
@@ -240,40 +246,42 @@ void cutlass_w4a8_group_gemm_caller(
   arguments = Args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes_as_shapes, nullptr},
-      {static_cast<const QuantType**>(b_ptrs.data_ptr()),
-       static_cast<typename Gemm::StrideB*>(b_strides.data_ptr()),
-       static_cast<const MmaType**>(a_ptrs.data_ptr()),
-       static_cast<typename Gemm::StrideA*>(a_strides.data_ptr()),
-       static_cast<const typename Gemm::ElementScalePacked**>(b_scales_ptrs.data_ptr()),
-       static_cast<typename Gemm::StrideS*>(s_strides.data_ptr()),
+      {static_cast<const QuantType**>(W4A8_MUTABLE_RAW_PTR(b_ptrs)),
+       static_cast<typename Gemm::StrideB*>(const_cast<void*>(b_strides.const_data_ptr())),
+       static_cast<const MmaType**>(W4A8_MUTABLE_RAW_PTR(a_ptrs)),
+       static_cast<typename Gemm::StrideA*>(const_cast<void*>(a_strides.const_data_ptr())),
+       static_cast<const typename Gemm::ElementScalePacked**>(W4A8_MUTABLE_RAW_PTR(b_scales_ptrs)),
+       static_cast<typename Gemm::StrideS*>(const_cast<void*>(s_strides.const_data_ptr())),
        static_cast<int>(chunk_size)},
       {fusion_args,
        nullptr,
        nullptr,
-       static_cast<ElementD**>(out_ptrs.data_ptr()),
-       static_cast<typename Gemm::StrideD*>(d_strides.data_ptr())},
+       static_cast<ElementD**>(W4A8_MUTABLE_RAW_PTR(out_ptrs)),
+       static_cast<typename Gemm::StrideD*>(const_cast<void*>(d_strides.const_data_ptr()))},
       hw_info};
 
   // Instantiate and run GEMM
   typename Gemm::GemmScaleOnly gemm;
   size_t workspace_size = Gemm::GemmScaleOnly::get_workspace_size(arguments);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a_tensors.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  SglTensor workspace = sgl_kernel::moe::stable::empty_contiguous(
+      device, std::array<int64_t, 1>{static_cast<int64_t>(workspace_size)}, SglScalarType::Byte);
 
   cutlass::Status status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "GEMM implementation not supported");
+    STD_TORCH_CHECK(false, "GEMM implementation not supported");
   }
 
-  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+  status = gemm.initialize(arguments, workspace.mutable_data_ptr(), stream);
   if (status != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "GEMM initialization failed");
+    STD_TORCH_CHECK(false, "GEMM initialization failed");
   }
 
   status = gemm.run(stream);
   if (status != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "GEMM execution failed");
+    STD_TORCH_CHECK(false, "GEMM execution failed");
   }
 }
 
 }  // namespace
+
+#undef W4A8_MUTABLE_RAW_PTR
