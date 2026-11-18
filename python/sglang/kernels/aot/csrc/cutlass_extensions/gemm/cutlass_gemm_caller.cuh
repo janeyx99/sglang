@@ -5,10 +5,11 @@
 
 // clang-format will break include orders
 // clang-format off
-#include <torch/all.h>
-
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/headeronly/core/Layout.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include "cutlass/cutlass.h"
 
@@ -22,27 +23,30 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
+
 // clang-format on
 
 /**
  * Helper function for checking CUTLASS errors
  */
-#define CUTLASS_CHECK(status)                                                       \
-  {                                                                                 \
-    cutlass::Status error = status;                                                 \
-    TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+#define CUTLASS_CHECK(status)                                                           \
+  {                                                                                     \
+    cutlass::Status error = status;                                                     \
+    STD_TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
 
 template <typename GemmKernel>
 void cutlass_gemm_caller(
-    torch::Device device,
+    torch::stable::Device device,
     cute::Shape<int, int, int, int> prob_shape,
     typename GemmKernel::MainloopArguments mainloop_args,
     typename GemmKernel::EpilogueArguments epilogue_args,
     typename GemmKernel::TileSchedulerArguments scheduler = {}) {
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = c10::cuda::current_device();
-  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  hw_info.device_id = torch::stable::accelerator::getCurrentDeviceIndex();
+  hw_info.sm_count = sgl_kernel::stable::get_cached_device_properties().multiProcessorCount;
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGemm, prob_shape, mainloop_args, epilogue_args, hw_info, scheduler};
 
@@ -52,11 +56,14 @@ void cutlass_gemm_caller(
   CUTLASS_CHECK(gemm_op.can_implement(args));
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(device);
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  auto workspace = torch::stable::empty(
+      {static_cast<int64_t>(workspace_size)},
+      torch::headeronly::ScalarType::Byte,
+      torch::headeronly::Layout::Strided,
+      device);
 
-  auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  auto stream = sgl_kernel::stable::get_current_cuda_stream(device.index());
 
-  cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
+  cutlass::Status status = gemm_op.run(args, workspace.mutable_data_ptr(), stream);
   CUTLASS_CHECK(status);
 }

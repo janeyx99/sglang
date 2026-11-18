@@ -76,7 +76,6 @@ def infllmv2_attn_stage1(
         window_size[1],
         softcap,
         True,
-        None,
     )
 
     return result[0]

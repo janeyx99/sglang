@@ -4,7 +4,9 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#endif
 #include <cuda.h>
 
 #include <vector>
@@ -120,7 +122,9 @@ struct Flash_fwd_params : public Qkv_params {
   float softcap;
 
   // Random state.
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
   at::PhiloxCudaState philox_args;
+#endif
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;

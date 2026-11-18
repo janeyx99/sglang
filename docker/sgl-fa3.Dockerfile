@@ -9,7 +9,7 @@ FROM ${BASE_IMG}:cuda${CUDA_VERSION}
 ARG ARCH=x86_64
 ARG CUDA_VERSION=13.0
 ARG PYTHON_TAG=cp310-cp310
-ARG TORCH_VER=2.14.1
+ARG TORCH_VER=2.11.0
 ARG CU_TAG=cu130
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
@@ -31,7 +31,7 @@ RUN set -eux; \
     ln -sf /usr/local/cuda-${CUDA_VERSION}/targets/${ARCH}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so
 
 # torch is needed at build time (CMake finds it, and the build is not isolated)
-# and is what the wheel pins. Keep TORCH_VER in step with sgl_fa3/pyproject.toml
+# and sets the oldest supported stable ABI. Keep TORCH_VER in step with sgl_fa3/pyproject.toml
 # and TORCH_VER in .github/workflows/release-whl-fa3.yml.
 RUN --mount=type=cache,id=sgl-fa3-pip,target=/root/.cache/pip \
     set -eux; \

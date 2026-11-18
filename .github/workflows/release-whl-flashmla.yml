@@ -8,10 +8,10 @@ on:
         type: string
         required: true
       branch:
-        description: "FlashMLA branch to build from (default: sgl)"
+        description: "Optional ref override in the pinned FlashMLA repository"
         type: string
         required: false
-        default: 'sgl'
+        default: ''
       validation_only:
         description: "Build and test without publishing wheels"
         type: boolean
@@ -28,10 +28,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The wheel pins this; it is also what the test jobs install.
-  # The extensions use PyTorch's stable C++ ABI and would load against any 2.10+,
-  # but a release is tested against one version.
-  TORCH_VER: "2.14.1"
+  # Build against the oldest supported CUDA 13 Torch runtime.
+  TORCH_VER: "2.11.0"
+  TEST_TORCH_VER: "2.14.1"
 
 jobs:
   build:
@@ -57,11 +56,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Read pinned FlashMLA source
+        id: source
+        run: |
+          jq -r '."sgl-flash-mla" | "repository=\(.repository)\ncommit=\(.commit)"' \
+            scripts/abi_cuda_dependencies.json >> "$GITHUB_OUTPUT"
+
       - name: Checkout FlashMLA
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/FlashMLA
-          ref: ${{ inputs.branch || 'sgl' }}
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.branch || steps.source.outputs.commit }}
           path: FlashMLA
           submodules: recursive
 
@@ -121,11 +126,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read pinned FlashMLA source
+        id: source
+        run: |
+          jq -r '."sgl-flash-mla" | "repository=\(.repository)\ncommit=\(.commit)"' \
+            scripts/abi_cuda_dependencies.json >> "$GITHUB_OUTPUT"
+
       - name: Checkout FlashMLA
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/FlashMLA
-          ref: ${{ inputs.branch || 'sgl' }}
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.branch || steps.source.outputs.commit }}
           path: FlashMLA
           submodules: recursive
 
@@ -145,7 +156,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install "torch==${TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
-          python3 -m pip install numpy einops rich pytest
+          python3 -m pip install numpy einops rich pytest torch-abi-audit
           # --force-reinstall: a base image may already carry this version, in
           # which case pip skips the wheel and the job tests a stale extension.
           python3 -m pip install dist/*.whl --force-reinstall --no-deps
@@ -189,6 +200,14 @@ jobs:
           python3 tests/legacy/test_flash_mla_sparse_prefill.py
           python3 tests/legacy/test_flash_mla_sparse_decoding.py
           python3 tests/legacy/test_flash_mla_sparse_decoding_v32_bit_equal.py
+
+      - name: Audit every native library in the wheel
+        run: python3 scripts/audit_cuda_wheels.py dist/*.whl
+
+      - name: Test the same wheel on the current Torch runtime
+        run: |
+          python3 -m pip install "torch==${TEST_TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+          python3 -m pytest FlashMLA/tests/legacy/test_sparse_prefill_stats.py -q
 
   release:
     if: |

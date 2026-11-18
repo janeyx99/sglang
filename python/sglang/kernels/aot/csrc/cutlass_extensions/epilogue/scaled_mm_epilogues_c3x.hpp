@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <torch/csrc/stable/tensor.h>
+
+#include <optional>
+
 #include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 
 /*
@@ -18,6 +22,7 @@
 namespace c3x {
 
 using namespace cute;
+using Tensor = torch::stable::Tensor;
 
 template <typename T>
 struct identity {
@@ -90,9 +95,9 @@ struct ScaledEpilogueBase {
   // from a tensor. It can handle both row and column, as well as row/column or
   // scalar cases.
   template <typename Descriptor, typename T>
-  static auto args_from_tensor(torch::Tensor const& tensor) {
+  static auto args_from_tensor(Tensor const& tensor) {
     using Arguments = typename Descriptor::Arguments;
-    auto* data_ptr = static_cast<T*>(tensor.data_ptr());
+    auto* data_ptr = const_cast<T*>(static_cast<const T*>(tensor.const_data_ptr()));
     if constexpr (std::is_same_v<Descriptor, ColOrScalarLoad<T>> || std::is_same_v<Descriptor, RowOrScalarLoad<T>>) {
       return Arguments{data_ptr, tensor.numel() != 1};
     } else {
@@ -104,9 +109,9 @@ struct ScaledEpilogueBase {
   // This overload handles the case where there might not be a tensor, in which
   // case a nullptr is passed and a constant (0) is used.
   template <typename Descriptor, typename T>
-  static auto args_from_tensor(std::optional<torch::Tensor> const& tensor) {
+  static auto args_from_tensor(std::optional<Tensor> const& tensor) {
     using Arguments = typename Descriptor::Arguments;
-    auto* data_ptr = tensor ? static_cast<T*>(tensor->data_ptr()) : nullptr;
+    auto* data_ptr = tensor ? const_cast<T*>(static_cast<const T*>(tensor->const_data_ptr())) : nullptr;
     static_assert(std::is_same_v<Descriptor, ColLoad<T, true>> || std::is_same_v<Descriptor, RowLoad<T, true>>);
     return Arguments{data_ptr};
   }
@@ -148,7 +153,7 @@ struct ScaledEpilogue : private ScaledEpilogueBase<ElementAcc, ElementD, TileSha
   using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<Compute1, ScaleA, EVTCompute0>;
   using ArgumentType = typename EVTCompute::Arguments;
 
-  static ArgumentType prepare_args(torch::Tensor const& a_scales, torch::Tensor const& b_scales) {
+  static ArgumentType prepare_args(Tensor const& a_scales, Tensor const& b_scales) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
 
@@ -187,8 +192,7 @@ struct ScaledEpilogueBias : private ScaledEpilogueBase<ElementAcc, ElementD, Til
   using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<Compute1, ScaleA, EVTCompute0, Bias>;
 
   using ArgumentType = typename EVTCompute::Arguments;
-  static ArgumentType
-  prepare_args(torch::Tensor const& a_scales, torch::Tensor const& b_scales, torch::Tensor const& bias) {
+  static ArgumentType prepare_args(Tensor const& a_scales, Tensor const& b_scales, Tensor const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
@@ -224,8 +228,7 @@ struct ScaledEpilogueColumnBias : private ScaledEpilogueBase<ElementAcc, Element
   using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<Compute1, ScaleA, EVTCompute0, Bias>;
 
   using ArgumentType = typename EVTCompute::Arguments;
-  static ArgumentType
-  prepare_args(torch::Tensor const& a_scales, torch::Tensor const& b_scales, torch::Tensor const& bias) {
+  static ArgumentType prepare_args(Tensor const& a_scales, Tensor const& b_scales, Tensor const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
@@ -274,10 +277,7 @@ struct ScaledEpilogueBiasAzp : private ScaledEpilogueBase<ElementAcc, ElementD, 
   using ArgumentType = typename EVTCompute::Arguments;
 
   static ArgumentType prepare_args(
-      torch::Tensor const& a_scales,
-      torch::Tensor const& b_scales,
-      torch::Tensor const& azp_adj,
-      std::optional<torch::Tensor> const& bias) {
+      Tensor const& a_scales, Tensor const& b_scales, Tensor const& azp_adj, std::optional<Tensor> const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
@@ -339,11 +339,11 @@ struct ScaledEpilogueBiasAzpToken : private ScaledEpilogueBase<ElementAcc, Eleme
   using ArgumentType = typename EVTCompute::Arguments;
 
   static ArgumentType prepare_args(
-      torch::Tensor const& a_scales,
-      torch::Tensor const& b_scales,
-      torch::Tensor const& azp_adj,
-      torch::Tensor const& azp,
-      std::optional<torch::Tensor> const& bias) {
+      Tensor const& a_scales,
+      Tensor const& b_scales,
+      Tensor const& azp_adj,
+      Tensor const& azp,
+      std::optional<Tensor> const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);

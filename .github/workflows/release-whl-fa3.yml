@@ -13,10 +13,10 @@ on:
         type: string
         required: true
       branch:
-        description: "sgl-flash-attn branch to build from (default: sgl-kernel)"
+        description: "Optional ref override in the pinned FA3 repository"
         type: string
         required: false
-        default: 'sgl-kernel'
+        default: ''
       validation_only:
         description: "Build and test without publishing wheels"
         type: boolean
@@ -34,9 +34,9 @@ concurrency:
 
 env:
   # Must match TORCH_VER in docker/sgl-fa3.Dockerfile and the pin in sgl_fa3/pyproject.toml:
-  # the extension uses the regular torch C++ ABI and only loads against this torch.
-  TORCH_VER: "2.14.1"
-  FA3_REPO: sgl-project/sgl-flash-attn
+  # build against the oldest supported stable Torch ABI.
+  TORCH_VER: "2.11.0"
+  TEST_TORCH_VER: "2.14.1"
 
 jobs:
   build:
@@ -52,12 +52,18 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Read pinned FA3 source
+        id: source
+        run: |
+          jq -r '."sgl-fa3" | "repository=\(.repository)\ncommit=\(.commit)"' \
+            scripts/abi_cuda_dependencies.json >> "$GITHUB_OUTPUT"
+
       # The build needs only the FA3 sources; CUTLASS is fetched by CMake.
       - name: Checkout sgl-flash-attn
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.FA3_REPO }}
-          ref: ${{ inputs.branch || 'sgl-kernel' }}
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.branch || steps.source.outputs.commit }}
           path: sgl-flash-attn
 
       - name: Set up Python 3.10
@@ -92,11 +98,19 @@ jobs:
     runs-on: 8-gpu-h200
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned FA3 source
+        id: source
+        run: |
+          jq -r '."sgl-fa3" | "repository=\(.repository)\ncommit=\(.commit)"' \
+            scripts/abi_cuda_dependencies.json >> "$GITHUB_OUTPUT"
+
       - name: Checkout sgl-flash-attn
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.FA3_REPO }}
-          ref: ${{ inputs.branch || 'sgl-kernel' }}
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.branch || steps.source.outputs.commit }}
           path: sgl-flash-attn
 
       # The tests need only sgl_fa3/tests. The source package would shadow the
@@ -115,7 +129,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install "torch==${TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
-          python3 -m pip install numpy einops pytest
+          python3 -m pip install numpy einops pytest torch-abi-audit
           # --force-reinstall: a base image may already carry this version, in
           # which case pip skips the wheel and the job tests a stale extension.
           python3 -m pip install dist/*.whl --force-reinstall --no-deps
@@ -134,6 +148,14 @@ jobs:
 
       - name: Run tests
         run: python3 -m pytest sgl-flash-attn/sgl_fa3/tests -q
+
+      - name: Audit native ABI
+        run: python3 scripts/audit_cuda_wheels.py dist/*.whl
+
+      - name: Test the same wheel on the current Torch runtime
+        run: |
+          python3 -m pip install "torch==${TEST_TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+          python3 -m pytest sgl-flash-attn/sgl_fa3/tests -q
 
   release:
     if: |

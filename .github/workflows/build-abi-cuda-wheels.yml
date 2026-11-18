@@ -1,0 +1,47 @@
+name: Build ABI CUDA wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Native build architecture"
+        type: choice
+        options: [x86_64, aarch64]
+        default: x86_64
+      runner:
+        description: "Runner with Docker/buildx and enough RAM for CUDA compilation"
+        type: string
+        default: x64-kernel-build-node
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install audit tools
+        run: python -m pip install packaging pytest torch-abi-audit
+      - name: Check ABI audit failure handling
+        run: python -m pytest --noconftest test/manual/test_abi_cuda_audit.py -q
+      - name: Build pinned dependencies and SGLang CUDA kernel
+        env:
+          BUILD_JOBS: "16"
+          MAX_JOBS: "16"
+          NVCC_THREADS: "2"
+          BUILD_ARCH: ${{ inputs.arch }}
+        run: |
+          python scripts/build_abi_cuda_wheels.py \
+            --arch "${BUILD_ARCH}" \
+            --work-dir "${RUNNER_TEMP}/abi-sources-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --output-dir "${RUNNER_TEMP}/abi-wheels-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abi-cu130-${{ inputs.arch }}
+          path: ${{ runner.temp }}/abi-wheels-${{ github.run_id }}-${{ github.run_attempt }}/*
+          if-no-files-found: error

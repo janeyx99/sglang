@@ -1,0 +1,16 @@
+{
+  "sgl-fa3": {
+    "repository": "janeyx99/flash-attention",
+    "commit": "d36a2fa7ba4811222b5b1d2277bf6699c538d952",
+    "pull_request": "https://github.com/sgl-project/sgl-flash-attn/pull/59",
+    "version": "0.1.0",
+    "architectures": ["x86_64"]
+  },
+  "sgl-flash-mla": {
+    "repository": "janeyx99/FlashMLA-ABI-Stable",
+    "commit": "a1dbfda44aa803ae138dd458756bafd38e63f294",
+    "pull_request": "https://github.com/sgl-project/FlashMLA/pull/37",
+    "version": "1.0.5",
+    "architectures": ["x86_64", "aarch64"]
+  }
+}

@@ -15,7 +15,9 @@
 #include "flash_blockmask.h"
 #include "kernel_traits.h"
 #include "mask.h"
-#include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+#include "philox_unpack.cuh"
+#endif
 #include "rotary.h"
 #include "softmax.h"
 #include "utils.h"
@@ -163,7 +165,12 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
   constexpr int kNWarps = Kernel_traits::kNWarps;
 
+#ifdef FLASHATTENTION_DISABLE_DROPOUT
+  static_assert(!Is_dropout);
+  const auto seed_offset = std::make_tuple(uint64_t{0}, uint64_t{0});
+#else
   auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+#endif
   flash::Dropout dropout(
       std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t, bidb, bidh, tidx, params.h);
 

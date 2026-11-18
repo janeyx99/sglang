@@ -18,7 +18,6 @@ limitations under the License.
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm89.h
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cudaTypedefs.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/memory.h>
@@ -37,7 +36,11 @@ limitations under the License.
 #include <cutlass/matrix_coord.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/tensor_ref.h>
-#include <torch/all.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Layout.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include <cute/tensor.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -47,12 +50,32 @@ limitations under the License.
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
+#include <optional>
 
 #include "cutlass_extensions/gemm/fp8_gemm_sm90_dispatch.cuh"
+#include "gemm/gemm_ops.h"
 #include "math.hpp"
-#include "utils.h"
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
 
 using namespace cute;
+
+namespace {
+
+int GetSMVersion() {
+  const auto& properties = sgl_kernel::stable::get_cached_device_properties();
+  return properties.major * 10 + properties.minor;
+}
+
+torch::stable::Tensor NewByteWorkspace(const torch::stable::Tensor& reference, size_t workspace_size) {
+  return torch::stable::empty(
+      {static_cast<int64_t>(workspace_size)},
+      torch::headeronly::ScalarType::Byte,
+      torch::headeronly::Layout::Strided,
+      reference.device());
+}
+
+}  // namespace
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
 template <
@@ -168,12 +191,12 @@ struct DeviceGemmFp8RowwiseSm89 {
 
 template <typename Gemm, bool WithBias>
 typename Gemm::Arguments prepare_sm89_fp8_args(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using ElementT = typename Gemm::ElementA;
   using ElementOutput = typename Gemm::ElementD;
   using ElementComputeEpilogue = float;
@@ -186,16 +209,21 @@ typename Gemm::Arguments prepare_sm89_fp8_args(
   int64_t ldb = b.stride(1);
   int64_t ldc = out.stride(0);
 
-  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.data_ptr());
-  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.data_ptr());
+  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.const_data_ptr());
+  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.const_data_ptr());
   ElementOutput const* ptr_bias = nullptr;
   if constexpr (WithBias) {
-    TORCH_CHECK(bias.has_value())
-    ptr_bias = reinterpret_cast<ElementOutput const*>(bias.value().data_ptr());
+    STD_TORCH_CHECK(
+        bias.has_value(),
+        "Expected bias.has_value() to be true, but got false.  (Could this error message be improved?  If so, "
+        "please report an enhancement request to PyTorch.)")
+    ptr_bias = reinterpret_cast<ElementOutput const*>(bias.value().const_data_ptr());
   }
-  ElementOutput* ptr_d = reinterpret_cast<ElementOutput*>(out.data_ptr());
-  ElementComputeEpilogue const* ptr_scales_a = reinterpret_cast<ElementComputeEpilogue const*>(scales_a.data_ptr());
-  ElementComputeEpilogue const* ptr_scales_b = reinterpret_cast<ElementComputeEpilogue const*>(scales_b.data_ptr());
+  ElementOutput* ptr_d = reinterpret_cast<ElementOutput*>(out.mutable_data_ptr());
+  ElementComputeEpilogue const* ptr_scales_a =
+      reinterpret_cast<ElementComputeEpilogue const*>(scales_a.const_data_ptr());
+  ElementComputeEpilogue const* ptr_scales_b =
+      reinterpret_cast<ElementComputeEpilogue const*>(scales_b.const_data_ptr());
 
   typename Gemm::Arguments args(
       cutlass::gemm::GemmUniversalMode::kGemm,  // Mode
@@ -246,35 +274,40 @@ typename Gemm::Arguments prepare_sm89_fp8_args(
 
 template <typename Gemm, bool WithBias>
 void launch_sm89_fp8_scaled_mm(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   auto args = prepare_sm89_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
   Gemm gemm_op;
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
-  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+  auto workspace = NewByteWorkspace(a, workspace_size);
+  auto stream = sgl_kernel::stable::get_current_cuda_stream(a.get_device_index());
 
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
+  STD_TORCH_CHECK(
+      can_implement == cutlass::Status::kSuccess,
+      "Expected can_implement == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
 
-  auto status = gemm_op(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess)
+  auto status = gemm_op(args, workspace.mutable_data_ptr(), stream);
+  STD_TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "Expected status == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
 }
 
 template <typename OutType, typename CtaShape, typename WarpShape, int Stages>
 void sm89_fp8_dispatch_bias(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
@@ -303,12 +336,12 @@ void sm89_fp8_dispatch_bias(
 
 template <typename OutType>
 void sm89_fp8_dispatch_shape(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   uint32_t const m = a.size(0);
   uint32_t const n = out.size(1);
 
@@ -549,9 +582,9 @@ struct DeviceGemmFp8RowwiseSm100 {
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   template <typename Descriptor, typename T>
-  static auto args_from_tensor(torch::Tensor const& tensor) {
+  static auto args_from_tensor(torch::stable::Tensor const& tensor) {
     using Arguments = typename Descriptor::Arguments;
-    auto* data_ptr = static_cast<T*>(tensor.data_ptr());
+    auto* data_ptr = const_cast<T*>(static_cast<const T*>(tensor.const_data_ptr()));
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
     if constexpr (std::is_same_v<Descriptor, ScalarScaleA>) {
@@ -563,9 +596,9 @@ struct DeviceGemmFp8RowwiseSm100 {
 
  public:
   static ArgumentType prepare_args(
-      torch::Tensor const& a_scales,
-      torch::Tensor const& b_scales,
-      std::optional<torch::Tensor> const& bias = std::nullopt) {
+      torch::stable::Tensor const& a_scales,
+      torch::stable::Tensor const& b_scales,
+      std::optional<torch::stable::Tensor> const& bias = std::nullopt) {
     auto a_args = args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = args_from_tensor<ScaleB, float>(b_scales);
 
@@ -582,12 +615,12 @@ struct DeviceGemmFp8RowwiseSm100 {
 
 template <typename GemmType, bool WithBias>
 typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using Gemm = typename GemmType::Gemm;
   using ElementT = typename Gemm::ElementA;
   using ElementC = typename Gemm::ElementC;
@@ -605,8 +638,8 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
   int32_t n = b.size(1);
   int32_t k = a.size(1);
 
-  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.data_ptr());
-  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.data_ptr());
+  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.const_data_ptr());
+  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.const_data_ptr());
 
   StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -620,11 +653,11 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
   cutlass::KernelHardwareInfo hw_info;
   typename GemmKernel::TileSchedulerArguments scheduler = {};
 
-  auto ptr_c = static_cast<ElementOutput*>(out.data_ptr());
+  auto ptr_c = static_cast<ElementOutput*>(out.mutable_data_ptr());
 
-  auto prepare_epilogue_args = [&](const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+  auto prepare_epilogue_args = [&](const std::optional<torch::stable::Tensor>& bias = std::nullopt) {
     if constexpr (WithBias) {
-      TORCH_CHECK(bias.has_value(), "Bias tensor is required but not provided.");
+      STD_TORCH_CHECK(bias.has_value(), "Bias tensor is required but not provided.");
       return typename GemmKernel::EpilogueArguments{
           GemmType::prepare_args(scales_a, scales_b, bias.value()), ptr_c, stride_c, ptr_c, stride_d};
     } else {
@@ -645,33 +678,38 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
 
 template <typename Gemm, bool WithBias>
 void launch_sm100_fp8_scaled_mm(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   auto args = prepare_sm100_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
 
   typename Gemm::Gemm gemm_op;
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
-  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+  auto workspace = NewByteWorkspace(a, workspace_size);
+  auto stream = sgl_kernel::stable::get_current_cuda_stream(a.get_device_index());
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
-  auto status = gemm_op.run(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess)
+  STD_TORCH_CHECK(
+      can_implement == cutlass::Status::kSuccess,
+      "Expected can_implement == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
+  auto status = gemm_op.run(args, workspace.mutable_data_ptr(), stream);
+  STD_TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "Expected status == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
 }
 
 template <typename OutType, bool ScalarA>
 void sm100_fp8_dispatch_bias(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using CTAShapeDefault = Shape<_256, _128, _64>;
   using ClusterShapeDefault = Shape<_2, _2, _1>;
 
@@ -820,12 +858,12 @@ void sm100_fp8_dispatch_bias(
 
 template <typename OutType>
 void sm100_fp8_dispatch_shape(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   if (scales_a.numel() == 1) {
     return sm100_fp8_dispatch_bias<OutType, true>(out, a, b, scales_a, scales_b, bias);
   }
@@ -942,9 +980,9 @@ struct DeviceGemmFp8RowwiseSm120 {
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   template <typename Descriptor, typename T>
-  static auto args_from_tensor(torch::Tensor const& tensor) {
+  static auto args_from_tensor(torch::stable::Tensor const& tensor) {
     using Arguments = typename Descriptor::Arguments;
-    auto* data_ptr = static_cast<T*>(tensor.data_ptr());
+    auto* data_ptr = const_cast<T*>(static_cast<const T*>(tensor.const_data_ptr()));
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
     if constexpr (std::is_same_v<Descriptor, ScalarScaleA>) {
@@ -956,9 +994,9 @@ struct DeviceGemmFp8RowwiseSm120 {
 
  public:
   static ArgumentType prepare_args(
-      torch::Tensor const& a_scales,
-      torch::Tensor const& b_scales,
-      std::optional<torch::Tensor> const& bias = std::nullopt) {
+      torch::stable::Tensor const& a_scales,
+      torch::stable::Tensor const& b_scales,
+      std::optional<torch::stable::Tensor> const& bias = std::nullopt) {
     auto a_args = args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = args_from_tensor<ScaleB, float>(b_scales);
 
@@ -975,12 +1013,12 @@ struct DeviceGemmFp8RowwiseSm120 {
 
 template <typename GemmType, bool WithBias>
 typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using Gemm = typename GemmType::Gemm;
   using ElementT = typename Gemm::ElementA;
   using ElementC = typename Gemm::ElementC;
@@ -998,8 +1036,8 @@ typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
   int32_t n = b.size(1);
   int32_t k = a.size(1);
 
-  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.data_ptr());
-  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.data_ptr());
+  ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.const_data_ptr());
+  ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.const_data_ptr());
 
   StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -1013,11 +1051,11 @@ typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
   cutlass::KernelHardwareInfo hw_info;
   typename GemmKernel::TileSchedulerArguments scheduler = {};
 
-  auto ptr_c = static_cast<ElementOutput*>(out.data_ptr());
+  auto ptr_c = static_cast<ElementOutput*>(out.mutable_data_ptr());
 
-  auto prepare_epilogue_args = [&](const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+  auto prepare_epilogue_args = [&](const std::optional<torch::stable::Tensor>& bias = std::nullopt) {
     if constexpr (WithBias) {
-      TORCH_CHECK(bias.has_value(), "Bias tensor is required but not provided.");
+      STD_TORCH_CHECK(bias.has_value(), "Bias tensor is required but not provided.");
       return typename GemmKernel::EpilogueArguments{
           GemmType::prepare_args(scales_a, scales_b, bias.value()), ptr_c, stride_c, ptr_c, stride_d};
     } else {
@@ -1038,33 +1076,38 @@ typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
 
 template <typename Gemm, bool WithBias>
 void launch_sm120_fp8_scaled_mm(
-    torch::Tensor& out,
-    torch::Tensor const& a,
-    torch::Tensor const& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   auto args = prepare_sm120_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
 
   typename Gemm::Gemm gemm_op;
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
-  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+  auto workspace = NewByteWorkspace(a, workspace_size);
+  auto stream = sgl_kernel::stable::get_current_cuda_stream(a.get_device_index());
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
-  auto status = gemm_op.run(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess)
+  STD_TORCH_CHECK(
+      can_implement == cutlass::Status::kSuccess,
+      "Expected can_implement == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
+  auto status = gemm_op.run(args, workspace.mutable_data_ptr(), stream);
+  STD_TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "Expected status == cutlass::Status::kSuccess to be true, but got false.  (Could this error message be "
+      "improved?  If so, please report an enhancement request to PyTorch.)")
 }
 
 template <typename OutType, bool ScalarA>
 void sm120_fp8_dispatch_bias(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   using CTAShapeDefault = Shape<_128, _128, _128>;
   using ClusterShapeDefault = Shape<_1, _1, _1>;
 
@@ -1109,12 +1152,12 @@ void sm120_fp8_dispatch_bias(
 
 template <typename OutType>
 void sm120_fp8_dispatch_shape(
-    torch::Tensor& out,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    torch::stable::Tensor& out,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const std::optional<torch::stable::Tensor>& bias) {
   if (scales_a.numel() == 1) {
     return sm120_fp8_dispatch_bias<OutType, true>(out, a, b, scales_a, scales_b, bias);
   }
@@ -1122,31 +1165,33 @@ void sm120_fp8_dispatch_shape(
 }
 #endif
 
-torch::Tensor fp8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias) {
-  TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
-  TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
-  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
-  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
-  TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
-  TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
+torch::stable::Tensor fp8_scaled_mm(
+    const torch::stable::Tensor& mat_a,
+    const torch::stable::Tensor& mat_b,
+    const torch::stable::Tensor& scales_a,
+    const torch::stable::Tensor& scales_b,
+    const torch::headeronly::ScalarType& out_dtype,
+    const std::optional<torch::stable::Tensor>& bias) {
+  STD_TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
+  STD_TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
+  STD_TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
+  STD_TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
+  STD_TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
+  STD_TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
+  STD_TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
-  TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
-  TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
+  STD_TORCH_CHECK(mat_a.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn, "mat_a must be Float8_e4m3fn");
+  STD_TORCH_CHECK(mat_b.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn, "mat_b must be Float8_e4m3fn");
+  STD_TORCH_CHECK(
+      out_dtype == torch::headeronly::ScalarType::Half || out_dtype == torch::headeronly::ScalarType::BFloat16,
+      "out_dtype must be Half or BFloat16");
 
-  auto sm_version = getSMVersion();
-  TORCH_CHECK(
+  auto sm_version = GetSMVersion();
+  STD_TORCH_CHECK(
       scales_a.numel() == 1 || scales_a.numel() == mat_a.size(0),
       "scales_a must contain either one scalar scale or one scale per row; got ",
       scales_a.numel(),
@@ -1159,37 +1204,38 @@ torch::Tensor fp8_scaled_mm(
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   scalar_a_scale_supported = scalar_a_scale_supported || sm_version >= 100;
 #endif
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       scales_a.numel() != 1 || mat_a.size(0) == 1 || scalar_a_scale_supported,
       "scalar scales_a with M > 1 is unsupported on SM",
       sm_version,
       " for this build; got M=",
       mat_a.size(0));
-  TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
-  TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
-  TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
-  TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
-  TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
+  STD_TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
+  STD_TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
+  STD_TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
+  STD_TORCH_CHECK(scales_a.scalar_type() == torch::headeronly::ScalarType::Float, "scales_a must be Float32");
+  STD_TORCH_CHECK(scales_b.scalar_type() == torch::headeronly::ScalarType::Float, "scales_b must be Float32");
 
   if (bias) {
-    TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
-    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
-    TORCH_CHECK(bias->dtype() == out_dtype, "bias dtype must match output dtype");
+    STD_TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
+    STD_TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
+    STD_TORCH_CHECK(bias->scalar_type() == out_dtype, "bias dtype must match output dtype");
   }
 
-  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
-  TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
+  torch::stable::Tensor out = torch::stable::new_empty(mat_a, {mat_a.size(0), mat_b.size(1)}, out_dtype);
+  STD_TORCH_CHECK(
+      (out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
-    if (out_dtype == torch::kBFloat16) {
+    if (out_dtype == torch::headeronly::ScalarType::BFloat16) {
       sm120_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
       sm120_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   } else if (sm_version >= 100) {
-    if (out_dtype == torch::kBFloat16) {
+    if (out_dtype == torch::headeronly::ScalarType::BFloat16) {
       sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
       sm100_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -1207,7 +1253,7 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
   if (sm_version == 89) {
-    if (out_dtype == torch::kBFloat16) {
+    if (out_dtype == torch::headeronly::ScalarType::BFloat16) {
       sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
       sm89_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -1216,5 +1262,6 @@ torch::Tensor fp8_scaled_mm(
   }
 #endif
 
-  TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented fp8_scaled_mm for current compute capability: ", sm_version);
+  STD_TORCH_CHECK(
+      false, "NotImplementedError: No implemented fp8_scaled_mm for current compute capability: ", sm_version);
 }

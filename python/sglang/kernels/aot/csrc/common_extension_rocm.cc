@@ -16,6 +16,7 @@ limitations under the License.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
 
+#include "moe/moe_ops.h"
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {

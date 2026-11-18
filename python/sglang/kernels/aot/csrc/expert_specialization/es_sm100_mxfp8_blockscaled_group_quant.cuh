@@ -1,14 +1,16 @@
 #pragma once
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <torch/all.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/csrc/stable/tensor.h>
 
 #include <cuda/ptx>
 
 #include "cute/tensor.hpp"
+#include "sgl_kernel_cuda_device.h"
+#include "sgl_kernel_cuda_stream.h"
 
 namespace expert_specialization {
 
@@ -360,12 +362,12 @@ __global__ void mxfp8_group_quant(
 
 template <typename T_IN>
 void launch_es_sm100_mxfp8_blockscaled_grouped_quant(
-    const torch::Tensor& input,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& blockscale_offsets,
-    torch::Tensor& quant_output,
-    torch::Tensor& scale_factor) {
+    const torch::stable::Tensor& input,
+    const torch::stable::Tensor& problem_sizes,
+    const torch::stable::Tensor& expert_offsets,
+    const torch::stable::Tensor& blockscale_offsets,
+    torch::stable::Tensor& quant_output,
+    torch::stable::Tensor& scale_factor) {
   ThrLayout thr_layout{};
   ValLayout val_layout{};
   SfR2SThrLayout r2s_thr_layout{};
@@ -384,24 +386,24 @@ void launch_es_sm100_mxfp8_blockscaled_grouped_quant(
   auto tiled_copy_r2s = cute::make_tiled_copy(CopyAtomR2S{}, r2s_thr_layout, r2s_val_layout);  // Tiler_MN: (16, 4)
 
   int max_active_blocks_per_sm = -1;
-  AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+  STD_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &max_active_blocks_per_sm,
       mxfp8_group_quant<T_IN, decltype(tiled_copy_g2r), decltype(tiled_copy_r2g), decltype(tiled_copy_r2s)>,
       THREAD_BLOCK_SIZE,
       0));
 
-  dim3 grid(at::cuda::getCurrentDeviceProperties()->multiProcessorCount * max_active_blocks_per_sm, 1, 1);
+  dim3 grid(sgl_kernel::stable::get_cached_device_properties().multiProcessorCount * max_active_blocks_per_sm, 1, 1);
   dim3 block(THREAD_BLOCK_SIZE, 1, 1);
   int num_experts = (int)problem_sizes.size(0);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = sgl_kernel::stable::get_current_cuda_stream();
   mxfp8_group_quant<T_IN, decltype(tiled_copy_g2r), decltype(tiled_copy_r2g), decltype(tiled_copy_r2s)>
       <<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T_IN*>(input.data_ptr()),
-          reinterpret_cast<const int*>(problem_sizes.data_ptr()),
-          reinterpret_cast<const int*>(expert_offsets.data_ptr()),
-          reinterpret_cast<const int*>(blockscale_offsets.data_ptr()),
-          reinterpret_cast<cutlass::float_e4m3_t*>(quant_output.data_ptr()),
-          reinterpret_cast<uint8_t*>(scale_factor.data_ptr()),
+          reinterpret_cast<const T_IN*>(input.const_data_ptr()),
+          reinterpret_cast<const int*>(problem_sizes.const_data_ptr()),
+          reinterpret_cast<const int*>(expert_offsets.const_data_ptr()),
+          reinterpret_cast<const int*>(blockscale_offsets.const_data_ptr()),
+          reinterpret_cast<cutlass::float_e4m3_t*>(quant_output.mutable_data_ptr()),
+          reinterpret_cast<uint8_t*>(scale_factor.mutable_data_ptr()),
           num_experts,
           tiled_copy_g2r,
           tiled_copy_r2g,
