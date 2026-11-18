@@ -36,19 +36,19 @@ inputs, negative expert IDs, overlapping views, and disjoint views.
 - FA3 is now the standalone `sgl_fa3/` package on the
   `sgl-project/sgl-flash-attn:sgl-kernel` branch.
 
-The companion FA3 refresh starts from `4d03021a0ffc`, selects
-`hopper/flash_api_stable.cpp`, preserves the November variant-pruning behavior,
-and carries Dao-AILab fixes `fc6bed978518` (KV batch-index length) and
-`aae6770da7df` (empty paged KV caches). Its build uses Torch 2.11; its runtime
-dependency is `torch>=2.11`. The SGLang FA3 Docker image and release validation
-are updated together with it. Builds consume the dependency PR commits directly.
+The companion FA3 refresh starts from `4d03021a0ffc` and mechanically converts
+the active `hopper/flash_api.cpp` in place. Its current validation, variant
+pruning, and scheduler heuristics are preserved; CUDA kernels and tests match
+the PR base. Its build uses Torch 2.11; its runtime dependency is `torch>=2.11`.
+The SGLang FA3 Docker image and release validation are updated together with it.
+Builds consume the dependency PR commits directly.
 
 ## Pinned dependency builds
 
 `scripts/abi_cuda_dependencies.json` is the source of truth for:
 
 - [FA3 PR #59](https://github.com/sgl-project/sgl-flash-attn/pull/59):
-  `janeyx99/flash-attention@248ad15bee531ebdad643da607d2b4fd515635ce`.
+  `janeyx99/flash-attention@d36a2fa7ba4811222b5b1d2277bf6699c538d952`.
 - [FlashMLA PR #37](https://github.com/sgl-project/FlashMLA/pull/37):
   `janeyx99/FlashMLA-ABI-Stable@a1dbfda44aa803ae138dd458756bafd38e63f294`.
   Its current and frozen kernels are already ABI-stable upstream; this PR
@@ -99,15 +99,17 @@ PyTorch 2.11.0+cu130 for compilation:
 - A representative selection of existing kernel tests reports 456 passed,
   25 skipped, and 4,303 deselected using the installed wheel. It samples up
   to 24 parameter combinations per function, rather than the full suite.
-- Standalone FA3, compiled for SM90a: 65 stable shim references, zero
-  unstable Torch references. Both dispatcher-contract tests pass on both
-  Torch runtimes using the same binary and the new Python loader.
+- Standalone FA3, revalidated on 2026-11-18 and compiled for SM90a: 66 stable
+  shim references, zero unstable Torch references. Both dispatcher schemas
+  exactly match the PR base on Torch 2.11 and 2.13. The same binary passes six
+  empty-query host calls on each runtime, including output aliasing and
+  optional sinks. These calls do not launch FA3 GPU kernels.
 - Both libraries in the published FlashMLA 1.0.5 aarch64 wheel audit clean:
   64 stable shims for current kernels and 68 for frozen kernels. The same
   wheel passes all 144 sparse-prefill statistics/CUDA-graph cases on each
   of Torch 2.11 and 2.13.
 
-The FA3 numerical/pruned-variant suite has 27 skips on this GB300 host.
+The unchanged FA3 pruned-variant suite has 14 skips on this GB300 host.
 SM8x/SM90 numerical validation, x86_64 release wheels, the complete Docker
 wheel-set build, and the updated workflows were not exercised locally. The
 local kernel wheel targets SM100f; it is a native development wheel, not a

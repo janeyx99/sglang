@@ -1,7 +1,7 @@
 {
   "sgl-fa3": {
     "repository": "janeyx99/flash-attention",
-    "commit": "248ad15bee531ebdad643da607d2b4fd515635ce",
+    "commit": "d36a2fa7ba4811222b5b1d2277bf6699c538d952",
     "pull_request": "https://github.com/sgl-project/sgl-flash-attn/pull/59",
     "version": "0.1.0",
     "architectures": ["x86_64"]
